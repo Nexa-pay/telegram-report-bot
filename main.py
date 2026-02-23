@@ -208,6 +208,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['awaiting_phone'] = True
         
+    elif query.data == 'resend_code':
+        # Handle code resend
+        phone = context.user_data.get('phone')
+        if phone:
+            await query.edit_message_text("🔄 **Resending verification code...**")
+            result = await account_manager.resend_code(phone)
+            if result['status'] == 'code_sent':
+                context.user_data['phone_code_hash'] = result.get('phone_code_hash')
+                context.user_data['awaiting_code'] = True
+                await query.edit_message_text(
+                    "📱 **New Verification Code Sent!**\n\n"
+                    "Please enter the new 5-digit code:\n"
+                    "**Example:** `12345`\n\n"
+                    "⏰ **Note:** Code expires in 2 minutes."
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ **Error:** {result.get('error', 'Failed to resend code')}\n\n"
+                    "Please try again with /start"
+                )
+        else:
+            await query.edit_message_text("❌ Session expired. Please start over with /start")
+            context.user_data.clear()
+        
     elif query.data == 'admin_panel':
         if db_user.role not in ['owner', 'admin']:
             await query.edit_message_text("⛔ **Access Denied!**\n\nYou don't have permission to access this panel.")
@@ -332,10 +356,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "📱 **Verification Code Sent!**\n\n"
                 "Please enter the 5-digit code you received:\n"
-                "**Example:** `12345`"
+                "**Example:** `12345`\n\n"
+                "⏰ **Note:** Code expires in 2 minutes."
             )
+        elif result['status'] == 'flood_wait':
+            wait_time = result.get('wait_time', 60)
+            await update.message.reply_text(
+                f"⏳ **Too Many Attempts**\n\n"
+                f"Please wait {wait_time} seconds before trying again.\n"
+                f"Your phone number: `{phone}`"
+            )
+            context.user_data.clear()
         else:
-            await update.message.reply_text(f"❌ **Error:** {result.get('error', 'Unknown error')}")
+            await update.message.reply_text(
+                f"❌ **Error:** {result.get('error', 'Unknown error')}\n\n"
+                "Please check your phone number and try again."
+            )
             context.user_data.clear()
             
     elif context.user_data.get('awaiting_code'):
@@ -358,6 +394,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "🔐 **Two-Step Verification Enabled**\n\n"
                 "Please enter your account password:"
+            )
+        elif result['status'] == 'code_expired':
+            # Code expired - offer to resend
+            keyboard = [
+                [InlineKeyboardButton("🔄 Resend Code", callback_data='resend_code')],
+                [InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "⏰ **Verification Code Expired**\n\n"
+                "The code you entered has expired. Codes are valid for 2 minutes only.\n\n"
+                "Would you like a new code?",
+                reply_markup=reply_markup
+            )
+        elif result['status'] == 'code_invalid':
+            await update.message.reply_text(
+                "❌ **Invalid Code**\n\n"
+                "The code you entered is incorrect. Please try again:"
+            )
+        elif result['status'] == 'flood_wait':
+            wait_time = result.get('wait_time', 60)
+            await update.message.reply_text(
+                f"⏳ **Too Many Attempts**\n\n"
+                f"Please wait {wait_time} seconds before trying again."
             )
         elif result['status'] == 'success':
             await update.message.reply_text(
@@ -390,6 +450,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "✅ **Account Added Successfully!**\n\n"
                 "You can now use this account for reporting."
+            )
+        elif result['status'] == 'password_error':
+            await update.message.reply_text(
+                "❌ **Incorrect Password**\n\n"
+                "The password you entered is incorrect. Please try again:"
             )
         else:
             await update.message.reply_text(
