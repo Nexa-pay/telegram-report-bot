@@ -50,7 +50,7 @@ class AccountManager:
             await client.connect()
             
             if not await client.is_user_authorized():
-                if not verification_code:
+                if not verification_code and not password:
                     # First step: Request code
                     try:
                         logger.info(f"Sending code request to {phone_number}")
@@ -100,8 +100,8 @@ class AccountManager:
                             'phone': phone_number,
                             'error': str(e)
                         }
-                        
-                else:
+                
+                elif verification_code and not password:
                     # Second step: Sign in with code
                     try:
                         logger.info(f"Attempting to sign in {phone_number} with code")
@@ -110,6 +110,7 @@ class AccountManager:
                         stored_hash = phone_code_hash or self.phone_code_hashes.get(phone_number)
                         
                         if not stored_hash:
+                            await client.disconnect()
                             return {
                                 'status': 'error', 
                                 'message': 'Missing phone_code_hash. Please start over.',
@@ -138,9 +139,28 @@ class AccountManager:
                                 phone_code_hash=stored_hash
                             )
                             
+                            # If successful, we're authorized
+                            
+                        except SessionPasswordNeededError:
+                            # 2FA enabled - store state and ask for password
+                            logger.info(f"2FA required for {phone_number}")
+                            
+                            # Store the hash for password step
+                            self.phone_code_hashes[phone_number] = stored_hash
+                            
+                            # Don't disconnect - keep client alive for password
+                            # We'll pass the client to the password step
+                            
+                            return {
+                                'status': 'password_needed', 
+                                'phone': phone_number,
+                                'phone_code_hash': stored_hash,
+                                'client': client,  # Pass the client for password step
+                                'message': 'This account has 2FA enabled. Please enter your password.'
+                            }
+                            
                         except PhoneCodeExpiredError:
                             logger.warning(f"Code expired for {phone_number}")
-                            # Clean up expired attempt
                             if phone_number in self.login_attempts:
                                 del self.login_attempts[phone_number]
                             if phone_number in self.phone_code_hashes:
@@ -161,37 +181,6 @@ class AccountManager:
                                 'message': 'Invalid verification code. Please try again.'
                             }
                             
-                        except SessionPasswordNeededError:
-                            # 2FA enabled
-                            logger.info(f"2FA required for {phone_number}")
-                            if password:
-                                try:
-                                    await client.sign_in(password=password)
-                                except PasswordHashInvalidError:
-                                    await client.disconnect()
-                                    return {
-                                        'status': 'password_error',
-                                        'phone': phone_number,
-                                        'error': 'Invalid password'
-                                    }
-                                except Exception as e:
-                                    await client.disconnect()
-                                    return {
-                                        'status': 'password_error',
-                                        'phone': phone_number,
-                                        'error': str(e)
-                                    }
-                            else:
-                                # Store the hash for password step
-                                self.phone_code_hashes[phone_number] = stored_hash
-                                await client.disconnect()
-                                return {
-                                    'status': 'password_needed', 
-                                    'phone': phone_number,
-                                    'phone_code_hash': stored_hash,
-                                    'message': 'This account has 2FA enabled. Please enter your password.'
-                                }
-                            
                     except FloodWaitError as e:
                         wait_time = e.seconds
                         logger.warning(f"Flood wait during sign in for {phone_number}: {wait_time} seconds")
@@ -208,6 +197,62 @@ class AccountManager:
                         await client.disconnect()
                         return {
                             'status': 'error',
+                            'phone': phone_number,
+                            'error': str(e)
+                        }
+                
+                elif password:
+                    # Third step: Sign in with password (2FA)
+                    try:
+                        logger.info(f"Attempting to sign in {phone_number} with password")
+                        
+                        # We need to reconnect if client wasn't passed
+                        if 'client' not in locals() or not client.is_connected():
+                            # Reconnect with the same session
+                            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+                            client = TelegramClient(session_path, API_ID, API_HASH)
+                            await client.connect()
+                            
+                            # We need to re-initiate the sign-in process
+                            stored_hash = phone_code_hash or self.phone_code_hashes.get(phone_number)
+                            if not stored_hash:
+                                await client.disconnect()
+                                return {
+                                    'status': 'error',
+                                    'phone': phone_number,
+                                    'error': 'Missing session information. Please start over.'
+                                }
+                            
+                            # First, we need to send the code again? No, we should have the hash
+                            # Try to sign in with password directly
+                        
+                        try:
+                            await client.sign_in(password=password)
+                            
+                        except PasswordHashInvalidError:
+                            await client.disconnect()
+                            return {
+                                'status': 'password_error',
+                                'phone': phone_number,
+                                'error': 'Invalid password'
+                            }
+                            
+                    except FloodWaitError as e:
+                        wait_time = e.seconds
+                        logger.warning(f"Flood wait during password for {phone_number}: {wait_time} seconds")
+                        await client.disconnect()
+                        return {
+                            'status': 'flood_wait',
+                            'phone': phone_number,
+                            'wait_time': wait_time,
+                            'message': f'Too many attempts. Please wait {wait_time} seconds.'
+                        }
+                        
+                    except Exception as e:
+                        logger.error(f"Error during password sign in for {phone_number}: {e}")
+                        await client.disconnect()
+                        return {
+                            'status': 'password_error',
                             'phone': phone_number,
                             'error': str(e)
                         }
@@ -379,8 +424,9 @@ This content is illegal and should be removed immediately.
                     f'/report {target_username}'
                 )
                 report_sent = True
-            except:
-                pass
+                logger.info(f"Reported via @SpamBot: {target_username}")
+            except Exception as e:
+                logger.error(f"Error reporting via @SpamBot: {e}")
             
             # Method 2: Send to Telegram support
             if not report_sent:
@@ -390,8 +436,9 @@ This content is illegal and should be removed immediately.
                         f"Report about {target_username}\n\n{report_text}"
                     )
                     report_sent = True
-                except:
-                    pass
+                    logger.info(f"Reported via Telegram support: {target_username}")
+                except Exception as e:
+                    logger.error(f"Error reporting via Telegram support: {e}")
             
             await client.disconnect()
             
