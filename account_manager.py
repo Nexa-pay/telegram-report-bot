@@ -5,7 +5,8 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     FloodWaitError,
     PhoneNumberBannedError,
-    PhoneNumberInvalidError
+    PhoneNumberInvalidError,
+    PasswordHashInvalidError
 )
 from telethon.sessions import StringSession
 from database import Session, TelegramAccount
@@ -166,6 +167,13 @@ class AccountManager:
                             if password:
                                 try:
                                     await client.sign_in(password=password)
+                                except PasswordHashInvalidError:
+                                    await client.disconnect()
+                                    return {
+                                        'status': 'password_error',
+                                        'phone': phone_number,
+                                        'error': 'Invalid password'
+                                    }
                                 except Exception as e:
                                     await client.disconnect()
                                     return {
@@ -174,6 +182,8 @@ class AccountManager:
                                         'error': str(e)
                                     }
                             else:
+                                # Store the hash for password step
+                                self.phone_code_hashes[phone_number] = stored_hash
                                 await client.disconnect()
                                 return {
                                     'status': 'password_needed', 
@@ -230,6 +240,8 @@ class AccountManager:
                 if os.path.exists(session_file):
                     os.remove(session_file)
                 
+                await client.disconnect()
+                
                 return {
                     'status': 'success', 
                     'phone': phone_number,
@@ -238,13 +250,12 @@ class AccountManager:
                 
             except Exception as e:
                 logger.error(f"Error saving account {phone_number} to database: {e}")
+                await client.disconnect()
                 return {
                     'status': 'error',
                     'phone': phone_number,
                     'error': f'Database error: {str(e)}'
                 }
-            finally:
-                await client.disconnect()
             
         except Exception as e:
             logger.error(f"Unexpected error adding account {phone_number}: {e}")
