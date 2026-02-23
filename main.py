@@ -1,27 +1,12 @@
-#!/usr/bin/env python3
-"""
-Telegram Report Bot - Auto reporting for channels, groups, and users
-Can be deployed on Railway.app
-"""
-
 import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional
-import re
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes
-)
-
-import config
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from database import Session, User, Transaction
+from account_manager import AccountManager
+from reporter import Reporter
+from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
+import asyncio
+from datetime import datetime
 
 # Enable logging
 logging.basicConfig(
@@ -30,396 +15,374 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-REPORT_TYPE, REPORT_TARGET, REPORT_REASON, REPORT_DETAILS, CONFIRMATION = range(5)
+# Initialize components
+session = Session()
+account_manager = AccountManager()
+reporter = Reporter()
 
-# Report types
-REPORT_TYPES = {
-    'user': '👤 User',
-    'group': '👥 Group',
-    'channel': '📢 Channel'
-}
-
-# User cooldown tracking
-user_cooldowns: Dict[int, datetime] = {}
-
-class ReportBot:
-    def __init__(self):
-        self.application = None
-        
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a welcome message when /start is issued."""
-        user = update.effective_user
-        welcome_msg = (
-            f"👋 Hello {user.first_name}!\n\n"
-            "Welcome to the Telegram Report Bot. This bot helps you report:\n"
-            "• Suspicious users\n"
-            "• Problematic groups\n"
-            "• Violating channels\n\n"
-            "Please use /report to start a new report.\n"
-            "Use /help to see all available commands."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
+    user = update.effective_user
+    
+    # Check if user exists
+    db_user = session.query(User).filter_by(user_id=user.id).first()
+    if not db_user:
+        role = 'owner' if user.id == OWNER_ID else 'user'
+        db_user = User(
+            user_id=user.id,
+            username=user.username,
+            tokens=999999 if role == 'owner' else DEFAULT_TOKENS,
+            role=role
         )
-        await update.message.reply_text(welcome_msg)
+        session.add(db_user)
+        session.commit()
+    
+    # Create main menu
+    keyboard = [
+        [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
+        [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
+        [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
+        [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
+        [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
+    ]
+    
+    if db_user.role in ['owner', 'admin']:
+        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
+    if db_user.role == 'owner':
+        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = f"""
+Welcome {user.first_name}!
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a help message."""
-        help_text = (
-            "📚 **Available Commands:**\n\n"
-            "/start - Start the bot\n"
-            "/help - Show this help message\n"
-            "/report - Report a user, group, or channel\n"
-            "/myreports - View your recent reports\n"
-            "/cancel - Cancel current operation\n\n"
-            "**How to Report:**\n"
-            "1. Use /report command\n"
-            "2. Select what you want to report\n"
-            "3. Provide the username or link\n"
-            "4. Choose a reason\n"
-            "5. Add additional details\n"
-            "6. Confirm your report\n\n"
-            "All reports are reviewed by our team."
+ID: {user.id}
+Tokens: {db_user.tokens}
+Role: {db_user.role}
+Reports Made: {db_user.reports_made}
+
+Select an option below:
+"""
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button presses"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    db_user = session.query(User).filter_by(user_id=user_id).first()
+    
+    if query.data == 'stats':
+        stats_text = f"""
+📊 Your Statistics
+
+User ID: {db_user.user_id}
+Username: @{db_user.username or 'N/A'}
+Tokens: {db_user.tokens}
+Role: {db_user.role}
+Reports Made: {db_user.reports_made}
+Joined: {db_user.joined_date.strftime('%Y-%m-%d')}
+Last Active: {db_user.last_active.strftime('%Y-%m-%d %H:%M')}
+"""
+        await query.edit_message_text(stats_text)
+        
+    elif query.data == 'report_menu':
+        # Show report categories
+        keyboard = []
+        for key, value in REPORT_CATEGORIES.items():
+            keyboard.append([InlineKeyboardButton(value, callback_data=f'report_cat_{key}')])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_to_main')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Select report category:",
+            reply_markup=reply_markup
         )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-
-    async def report_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Start the report conversation."""
-        user_id = update.effective_user.id
         
-        # Check cooldown
-        if user_id in user_cooldowns:
-            cooldown_end = user_cooldowns[user_id]
-            if datetime.now() < cooldown_end:
-                remaining = (cooldown_end - datetime.now()).seconds
-                await update.message.reply_text(
-                    f"⏰ Please wait {remaining} seconds before creating another report."
-                )
-                return ConversationHandler.END
+    elif query.data.startswith('report_cat_'):
+        category = query.data.replace('report_cat_', '')
+        context.user_data['report_category'] = category
+        context.user_data['report_template'] = REPORT_TEMPLATES.get(category, "")
         
-        # Create inline keyboard for report types
         keyboard = [
-            [InlineKeyboardButton(REPORT_TYPES['user'], callback_data='type_user')],
-            [InlineKeyboardButton(REPORT_TYPES['group'], callback_data='type_group')],
-            [InlineKeyboardButton(REPORT_TYPES['channel'], callback_data='type_channel')],
-            [InlineKeyboardButton('❌ Cancel', callback_data='cancel')]
+            [InlineKeyboardButton("📝 Use Template", callback_data='use_template')],
+            [InlineKeyboardButton("✏️ Custom Text", callback_data='custom_text')],
+            [InlineKeyboardButton("🔙 Back", callback_data='report_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "🔍 **What would you like to report?**\n\n"
-            "Please select one of the options below:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return REPORT_TYPE
-
-    async def report_type_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle report type selection."""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == 'cancel':
-            await query.edit_message_text("❌ Report cancelled.")
-            return ConversationHandler.END
-        
-        # Store report type in context
-        report_type = query.data.replace('type_', '')
-        context.user_data['report_type'] = report_type
         
         await query.edit_message_text(
-            f"📝 You selected: **{REPORT_TYPES[report_type]}**\n\n"
-            f"Please send the username or invite link of the {report_type} you want to report.\n\n"
-            f"Examples:\n"
-            f"• Username: @username\n"
-            f"• Link: https://t.me/username\n"
-            f"• Group link: https://t.me/+abc123...",
-            parse_mode='Markdown'
+            f"Category: {REPORT_CATEGORIES[category]}\n\n"
+            f"Template: {REPORT_TEMPLATES[category]}\n\n"
+            "Choose an option:",
+            reply_markup=reply_markup
         )
         
-        return REPORT_TARGET
-
-    async def report_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store the target username/link."""
-        target = update.message.text.strip()
-        
-        # Validate target format
-        if not self.validate_target(target):
-            await update.message.reply_text(
-                "❌ Invalid format. Please provide a valid username or Telegram link.\n\n"
-                "Examples:\n"
-                "• @username\n"
-                "• https://t.me/username\n"
-                "• https://t.me/+abc123..."
-            )
-            return REPORT_TARGET
-        
-        context.user_data['report_target'] = target
-        
-        # Create keyboard for report reasons
-        reasons = {
-            'spam': '📧 Spam',
-            'scam': '💰 Scam/Fraud',
-            'harassment': '⚠️ Harassment',
-            'illegal': '🚫 Illegal Content',
-            'impersonation': '👤 Impersonation',
-            'other': '📌 Other'
-        }
-        
-        keyboard = [
-            [InlineKeyboardButton(reason, callback_data=f'reason_{key}')]
-            for key, reason in reasons.items()
-        ]
-        keyboard.append([InlineKeyboardButton('❌ Cancel', callback_data='cancel')])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "⚠️ **Select a reason for your report:**",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return REPORT_REASON
-
-    async def report_reason_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle reason selection."""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == 'cancel':
-            await query.edit_message_text("❌ Report cancelled.")
-            return ConversationHandler.END
-        
-        reason = query.data.replace('reason_', '')
-        context.user_data['report_reason'] = reason
-        
+    elif query.data == 'use_template':
+        context.user_data['report_text'] = context.user_data['report_template']
         await query.edit_message_text(
-            "📝 **Please provide additional details:**\n\n"
-            "Include any relevant information that might help us investigate this report.\n"
-            f"Maximum {config.MAX_REPORT_LENGTH} characters.\n\n"
-            "Send /skip to continue without additional details.",
-            parse_mode='Markdown'
+            "Send me the username or ID of the target (user, group, or channel)\n"
+            "You can send multiple by separating with commas or new lines."
+        )
+        context.user_data['awaiting_target'] = True
+        
+    elif query.data == 'custom_text':
+        await query.edit_message_text(
+            "Send me your custom report text:"
+        )
+        context.user_data['awaiting_custom_text'] = True
+        
+    elif query.data == 'buy_tokens':
+        keyboard = [
+            [InlineKeyboardButton("10 Tokens - $1", callback_data='buy_10')],
+            [InlineKeyboardButton("50 Tokens - $4", callback_data='buy_50')],
+            [InlineKeyboardButton("100 Tokens - $7", callback_data='buy_100')],
+            [InlineKeyboardButton("500 Tokens - $30", callback_data='buy_500')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "💰 Buy Tokens\n\n"
+            f"Your current tokens: {db_user.tokens}\n"
+            "Select package:",
+            reply_markup=reply_markup
         )
         
-        return REPORT_DETAILS
-
-    async def report_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Store additional details."""
-        details = update.message.text.strip()
-        
-        if len(details) > config.MAX_REPORT_LENGTH:
-            await update.message.reply_text(
-                f"❌ Details too long. Maximum {config.MAX_REPORT_LENGTH} characters allowed.\n"
-                "Please try again or use /skip to continue without details."
-            )
-            return REPORT_DETAILS
-        
-        context.user_data['report_details'] = details
-        return await self.confirm_report(update, context)
-
-    async def skip_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Skip additional details."""
-        context.user_data['report_details'] = "No additional details provided."
-        return await self.confirm_report(update, context)
-
-    async def confirm_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Show report summary for confirmation."""
-        user_data = context.user_data
-        
-        summary = (
-            "📋 **Please confirm your report:**\n\n"
-            f"**Type:** {REPORT_TYPES[user_data['report_type']]}\n"
-            f"**Target:** {user_data['report_target']}\n"
-            f"**Reason:** {user_data['report_reason'].capitalize()}\n"
-            f"**Details:** {user_data['report_details'][:200]}"
+    elif query.data.startswith('buy_'):
+        amount = int(query.data.replace('buy_', ''))
+        # Here you would integrate with payment gateway
+        await query.edit_message_text(
+            f"To purchase {amount} tokens, please contact @admin\n\n"
+            "Payment integration coming soon!"
         )
+        
+    elif query.data == 'my_reports':
+        reports = session.query(Report).filter_by(reported_by=user_id).order_by(Report.created_at.desc()).limit(10).all()
+        
+        if not reports:
+            await query.edit_message_text("You haven't made any reports yet.")
+            return
+        
+        text = "📋 Your Recent Reports:\n\n"
+        for report in reports:
+            text += f"ID: {report.id}\n"
+            text += f"Target: {report.target_username or report.target_id}\n"
+            text += f"Category: {report.category}\n"
+            text += f"Status: {report.status}\n"
+            text += f"Date: {report.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+            text += "-" * 20 + "\n"
+        
+        await query.edit_message_text(text)
+        
+    elif query.data == 'add_account':
+        await query.edit_message_text(
+            "📱 Add Telegram Account\n\n"
+            "Please send me your phone number in international format:\n"
+            "Example: +1234567890"
+        )
+        context.user_data['awaiting_phone'] = True
+        
+    elif query.data == 'admin_panel':
+        if db_user.role not in ['owner', 'admin']:
+            await query.edit_message_text("Access denied!")
+            return
+        
+        total_users = session.query(User).count()
+        total_accounts = session.query(TelegramAccount).count()
+        active_accounts = session.query(TelegramAccount).filter_by(is_active=True).count()
+        pending_reports = session.query(Report).filter_by(status='pending').count()
         
         keyboard = [
-            [
-                InlineKeyboardButton('✅ Confirm', callback_data='confirm'),
-                InlineKeyboardButton('❌ Cancel', callback_data='cancel')
-            ]
+            [InlineKeyboardButton("👥 Users", callback_data='admin_users')],
+            [InlineKeyboardButton("📱 Accounts", callback_data='admin_accounts')],
+            [InlineKeyboardButton("📊 Reports", callback_data='admin_reports')],
+            [InlineKeyboardButton("💰 Give Tokens", callback_data='admin_give_tokens')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Handle both message and callback query contexts
-        if update.message:
-            await update.message.reply_text(summary, reply_markup=reply_markup, parse_mode='Markdown')
+        text = f"""
+⚙️ Admin Panel
+
+Statistics:
+Total Users: {total_users}
+Total Accounts: {total_accounts}
+Active Accounts: {active_accounts}
+Pending Reports: {pending_reports}
+"""
+        await query.edit_message_text(text, reply_markup=reply_markup)
+        
+    elif query.data == 'owner_panel':
+        if db_user.role != 'owner':
+            await query.edit_message_text("Access denied!")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 Add Tokens", callback_data='owner_add_tokens')],
+            [InlineKeyboardButton("👑 Add Admin", callback_data='owner_add_admin')],
+            [InlineKeyboardButton("📊 System Stats", callback_data='owner_stats')],
+            [InlineKeyboardButton("⚙️ Settings", callback_data='owner_settings')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text("👑 Owner Panel", reply_markup=reply_markup)
+        
+    elif query.data == 'back_to_main':
+        await start(update, context)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    if context.user_data.get('awaiting_phone'):
+        # Handle phone number for account addition
+        phone = text
+        context.user_data['phone'] = phone
+        context.user_data['awaiting_phone'] = False
+        context.user_data['awaiting_code'] = True
+        
+        result = await account_manager.add_account(phone)
+        
+        if result['status'] == 'code_sent':
+            await update.message.reply_text(
+                "Verification code sent to your phone.\n"
+                "Please enter the code:"
+            )
         else:
-            await update.callback_query.edit_message_text(summary, reply_markup=reply_markup, parse_mode='Markdown')
+            await update.message.reply_text(f"Error: {result.get('error', 'Unknown error')}")
+            
+    elif context.user_data.get('awaiting_code'):
+        # Handle verification code
+        code = text
+        phone = context.user_data.get('phone')
         
-        return CONFIRMATION
-
-    async def confirmation_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle report confirmation."""
-        query = update.callback_query
-        await query.answer()
+        result = await account_manager.add_account(phone, code)
         
-        if query.data == 'cancel':
-            await query.edit_message_text("❌ Report cancelled.")
-            return ConversationHandler.END
+        if result['status'] == 'password_needed':
+            context.user_data['awaiting_password'] = True
+            await update.message.reply_text("This account has 2FA enabled. Please enter your password:")
+        elif result['status'] == 'success':
+            await update.message.reply_text("✅ Account added successfully!")
+            context.user_data.clear()
+        else:
+            await update.message.reply_text(f"Error: {result.get('error', 'Unknown error')}")
+            
+    elif context.user_data.get('awaiting_password'):
+        # Handle 2FA password
+        password = text
+        phone = context.user_data.get('phone')
         
-        # Save the report
-        await self.save_report(update, context)
+        result = await account_manager.add_account(phone, password=password)
         
-        # Set cooldown
-        user_id = update.effective_user.id
-        user_cooldowns[user_id] = datetime.now() + timedelta(seconds=config.REPORT_COOLDOWN)
-        
-        await query.edit_message_text(
-            "✅ **Report submitted successfully!**\n\n"
-            "Thank you for helping keep Telegram safe. Our team will review your report.\n"
-            "You can use /report to submit another report.",
-            parse_mode='Markdown'
-        )
-        
-        # Clear user data
-        context.user_data.clear()
-        
-        return ConversationHandler.END
-
-    async def save_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Save report to database and forward to admin channel."""
-        user_data = context.user_data
-        user = update.effective_user
-        
-        report_text = (
-            f"🚨 **NEW REPORT**\n\n"
-            f"**Report ID:** #{datetime.now().strftime('%Y%m%d%H%M%S')}\n"
-            f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"**Reporter:** {user.full_name} (ID: `{user.id}`)\n"
-            f"**Type:** {REPORT_TYPES[user_data['report_type']]}\n"
-            f"**Target:** {user_data['report_target']}\n"
-            f"**Reason:** {user_data['report_reason'].capitalize()}\n"
-            f"**Details:** {user_data['report_details']}\n"
-        )
-        
-        # Send to report channel if configured
-        if config.REPORT_CHANNEL_ID:
-            try:
-                await context.bot.send_message(
-                    chat_id=config.REPORT_CHANNEL_ID,
-                    text=report_text,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Failed to send report to channel: {e}")
-        
-        # Send to admins
-        for admin_id in config.ADMIN_IDS:
-            try:
-                # Add action buttons for admins
-                keyboard = [
-                    [
-                        InlineKeyboardButton('✅ Resolve', callback_data=f'resolve_{user.id}'),
-                        InlineKeyboardButton('❌ Reject', callback_data=f'reject_{user.id}')
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=report_text,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Failed to send report to admin {admin_id}: {e}")
-
-    async def my_reports(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show user's recent reports."""
-        # This is a placeholder - implement database query for actual report history
+        if result['status'] == 'success':
+            await update.message.reply_text("✅ Account added successfully!")
+            context.user_data.clear()
+        else:
+            await update.message.reply_text(f"Error: {result.get('error', 'Unknown error')}")
+            
+    elif context.user_data.get('awaiting_custom_text'):
+        # Handle custom report text
+        context.user_data['report_text'] = text
+        context.user_data['awaiting_custom_text'] = False
+        context.user_data['awaiting_target'] = True
         await update.message.reply_text(
-            "📊 Your recent reports feature will be available soon.\n"
-            "This would show your last 5 reports and their status."
+            "Send me the username or ID of the target (user, group, or channel)\n"
+            "You can send multiple by separating with commas or new lines."
         )
-
-    async def admin_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle admin actions on reports."""
-        query = update.callback_query
-        await query.answer()
         
-        if query.data.startswith('resolve'):
-            await query.edit_message_text(
-                query.message.text + "\n\n✅ **Report resolved by admin**",
-                parse_mode='Markdown'
+    elif context.user_data.get('awaiting_target'):
+        # Handle target(s) for reporting
+        targets = []
+        for line in text.split('\n'):
+            for item in line.split(','):
+                target = item.strip()
+                if target:
+                    target_type = 'user'
+                    if target.startswith('@'):
+                        target_type = 'channel'  # Could be group or channel
+                    elif target.startswith('-100'):
+                        target_type = 'channel'  # Telegram channel ID
+                    
+                    targets.append({
+                        'type': target_type,
+                        'username': target if target.startswith('@') else None,
+                        'id': target if not target.startswith('@') else None
+                    })
+        
+        if not targets:
+            await update.message.reply_text("No valid targets found!")
+            return
+        
+        # Check tokens
+        db_user = session.query(User).filter_by(user_id=user_id).first()
+        if db_user.role != 'owner' and db_user.tokens < len(targets):
+            await update.message.reply_text(
+                f"Insufficient tokens! You need {len(targets)} tokens but have {db_user.tokens}."
             )
-        elif query.data.startswith('reject'):
-            await query.edit_message_text(
-                query.message.text + "\n\n❌ **Report rejected by admin**",
-                parse_mode='Markdown'
-            )
+            return
+        
+        # Send confirmation
+        category = context.user_data.get('report_category')
+        report_text = context.user_data.get('report_text')
+        
+        confirm_text = f"""
+📝 Report Confirmation
 
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Cancel the conversation."""
-        await update.message.reply_text(
-            "❌ Operation cancelled. Use /report to start a new report."
-        )
-        return ConversationHandler.END
+Category: {REPORT_CATEGORIES.get(category, category)}
+Targets: {len(targets)}
+Cost: {len(targets) * REPORT_COST} tokens
+Your tokens: {db_user.tokens}
 
-    def validate_target(self, target: str) -> bool:
-        """Validate report target format."""
-        patterns = [
-            r'^@\w{5,32}$',  # Username format
-            r'^https?://t\.me/[\w\+]+/?$',  # Telegram link
-            r'^https?://t\.me/\+[\w]+$',  # Private group invite
+Report Text:
+{report_text}
+
+Proceed with reporting?
+"""
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, Proceed", callback_data='confirm_report')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]
         ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        return any(re.match(pattern, target) for pattern in patterns)
-
-    def setup(self):
-        """Set up the bot application and handlers."""
-        # Create application
-        self.application = Application.builder().token(config.BOT_TOKEN).build()
-
-        # Conversation handler for reporting
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('report', self.report_command)],
-            states={
-                REPORT_TYPE: [CallbackQueryHandler(self.report_type_callback, pattern='^(type_|cancel)')],
-                REPORT_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.report_target)],
-                REPORT_REASON: [CallbackQueryHandler(self.report_reason_callback, pattern='^(reason_|cancel)')],
-                REPORT_DETAILS: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.report_details),
-                    CommandHandler('skip', self.skip_details)
-                ],
-                CONFIRMATION: [CallbackQueryHandler(self.confirmation_callback, pattern='^(confirm|cancel)$')],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)],
-        )
-
-        # Add handlers
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("myreports", self.my_reports))
-        self.application.add_handler(conv_handler)
-        self.application.add_handler(CallbackQueryHandler(self.admin_callback, pattern='^(resolve|reject)'))
-
-    async def run(self):
-        """Run the bot."""
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
+        context.user_data['targets'] = targets
+        await update.message.reply_text(confirm_text, reply_markup=reply_markup)
         
-        logger.info("Bot started. Press Ctrl+C to stop.")
+    elif query.data == 'confirm_report':
+        # Execute reports
+        targets = context.user_data.get('targets', [])
+        category = context.user_data.get('report_category')
+        report_text = context.user_data.get('report_text')
         
-        # Keep the bot running
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Stopping bot...")
-        finally:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+        await query.edit_message_text("🔄 Processing reports... This may take a few minutes.")
+        
+        result = await reporter.bulk_report(targets, category, report_text, user_id)
+        
+        if result['status'] == 'success':
+            success_count = len(result['report_ids'])
+            await query.edit_message_text(
+                f"✅ Successfully submitted {success_count} reports!\n"
+                f"Report IDs: {', '.join(map(str, result['report_ids']))}"
+            )
+        else:
+            await query.edit_message_text(f"❌ Error: {result['message']}")
+        
+        context.user_data.clear()
 
 def main():
-    """Main function to run the bot."""
-    bot = ReportBot()
-    bot.setup()
+    """Start the bot"""
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    # Run the bot
-    asyncio.run(bot.run())
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
