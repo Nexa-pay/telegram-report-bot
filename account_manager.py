@@ -4,16 +4,17 @@ from telethon.errors import (
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     FloodWaitError,
-    PhoneNumberBannedError,
     PhoneNumberInvalidError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    PhoneCodeHashEmptyError,
+    InvalidBufferError
 )
 from telethon.sessions import StringSession
 from database import Session, TelegramAccount
-import asyncio
 import logging
 import os
 import time
+import asyncio
 from config import API_ID, API_HASH
 
 # Create sessions directory if it doesn't exist
@@ -25,27 +26,42 @@ logger = logging.getLogger(__name__)
 
 class AccountManager:
     def __init__(self):
-        self.active_clients = {}
         self.session = Session()
         # Store phone_code_hash temporarily
         self.phone_code_hashes = {}
         # Store login attempts to track expiration
         self.login_attempts = {}
+        # Store active clients for 2FA
+        self.active_clients = {}
         
     async def add_account(self, phone_number, verification_code=None, password=None, phone_code_hash=None):
         """Add a new Telegram account for reporting with improved error handling"""
+        client = None
         try:
-            # Check if there's an existing login attempt that expired
+            # Clean up any existing session files for this phone
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
+            if os.path.exists(session_file):
+                os.remove(session_file)
+                logger.info(f"Removed existing session file for {phone_number}")
+            
+            # Check if there's an existing login attempt that's too old
             if phone_number in self.login_attempts:
                 attempt_time = self.login_attempts[phone_number].get('timestamp', 0)
                 if time.time() - attempt_time > 120:  # 2 minutes
-                    # Login attempt expired, remove it
+                    # Login attempt expired, remove it and clean up
+                    logger.info(f"Cleaning up expired login attempt for {phone_number}")
                     del self.login_attempts[phone_number]
                     if phone_number in self.phone_code_hashes:
                         del self.phone_code_hashes[phone_number]
+                    if phone_number in self.active_clients:
+                        try:
+                            await self.active_clients[phone_number].disconnect()
+                        except:
+                            pass
+                        del self.active_clients[phone_number]
             
-            # Use file-based session for initial authentication
-            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            # Create new client
             client = TelegramClient(session_path, API_ID, API_HASH)
             await client.connect()
             
@@ -54,6 +70,10 @@ class AccountManager:
                     # First step: Request code
                     try:
                         logger.info(f"Sending code request to {phone_number}")
+                        
+                        # Add a small delay to avoid rate limiting
+                        await asyncio.sleep(1)
+                        
                         result = await client.send_code_request(phone_number)
                         
                         # Store the phone_code_hash
@@ -122,6 +142,7 @@ class AccountManager:
                             attempt_time = self.login_attempts[phone_number].get('timestamp', 0)
                             if time.time() - attempt_time > 120:
                                 # Clean up expired attempt
+                                logger.info(f"Code expired for {phone_number}")
                                 del self.login_attempts[phone_number]
                                 if phone_number in self.phone_code_hashes:
                                     del self.phone_code_hashes[phone_number]
@@ -133,29 +154,30 @@ class AccountManager:
                                 }
                         
                         try:
+                            # Add a small delay
+                            await asyncio.sleep(1)
+                            
                             await client.sign_in(
                                 phone_number, 
                                 code=verification_code,
                                 phone_code_hash=stored_hash
                             )
                             
-                            # If successful, we're authorized
+                            # If we get here, sign in was successful (no 2FA)
+                            logger.info(f"Code sign in successful for {phone_number}")
                             
                         except SessionPasswordNeededError:
-                            # 2FA enabled - store state and ask for password
+                            # 2FA enabled - store the client for password step
                             logger.info(f"2FA required for {phone_number}")
                             
-                            # Store the hash for password step
+                            # Store the hash and client for password step
                             self.phone_code_hashes[phone_number] = stored_hash
-                            
-                            # Don't disconnect - keep client alive for password
-                            # We'll pass the client to the password step
+                            self.active_clients[phone_number] = client
                             
                             return {
                                 'status': 'password_needed', 
                                 'phone': phone_number,
                                 'phone_code_hash': stored_hash,
-                                'client': client,  # Pass the client for password step
                                 'message': 'This account has 2FA enabled. Please enter your password.'
                             }
                             
@@ -179,6 +201,15 @@ class AccountManager:
                                 'status': 'code_invalid',
                                 'phone': phone_number,
                                 'message': 'Invalid verification code. Please try again.'
+                            }
+                            
+                        except PhoneCodeHashEmptyError:
+                            logger.warning(f"Code hash empty for {phone_number}")
+                            await client.disconnect()
+                            return {
+                                'status': 'error',
+                                'phone': phone_number,
+                                'message': 'Session error. Please start over.'
                             }
                             
                     except FloodWaitError as e:
@@ -206,31 +237,33 @@ class AccountManager:
                     try:
                         logger.info(f"Attempting to sign in {phone_number} with password")
                         
-                        # We need to reconnect if client wasn't passed
-                        if 'client' not in locals() or not client.is_connected():
-                            # Reconnect with the same session
-                            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
-                            client = TelegramClient(session_path, API_ID, API_HASH)
-                            await client.connect()
-                            
-                            # We need to re-initiate the sign-in process
-                            stored_hash = phone_code_hash or self.phone_code_hashes.get(phone_number)
-                            if not stored_hash:
-                                await client.disconnect()
-                                return {
-                                    'status': 'error',
-                                    'phone': phone_number,
-                                    'error': 'Missing session information. Please start over.'
-                                }
-                            
-                            # First, we need to send the code again? No, we should have the hash
-                            # Try to sign in with password directly
+                        # Get the stored client for this phone number
+                        client = self.active_clients.get(phone_number)
+                        
+                        if not client or not client.is_connected():
+                            logger.info(f"Client not found or disconnected for {phone_number}, starting over")
+                            if phone_number in self.active_clients:
+                                del self.active_clients[phone_number]
+                            if phone_number in self.phone_code_hashes:
+                                del self.phone_code_hashes[phone_number]
+                            if phone_number in self.login_attempts:
+                                del self.login_attempts[phone_number]
+                            return {
+                                'status': 'error',
+                                'phone': phone_number,
+                                'error': 'Session expired. Please start over with phone number.'
+                            }
                         
                         try:
+                            # Add a small delay
+                            await asyncio.sleep(1)
+                            
                             await client.sign_in(password=password)
+                            logger.info(f"Password sign in successful for {phone_number}")
                             
                         except PasswordHashInvalidError:
-                            await client.disconnect()
+                            logger.warning(f"Invalid password for {phone_number}")
+                            # Keep client alive for retry
                             return {
                                 'status': 'password_error',
                                 'phone': phone_number,
@@ -240,7 +273,10 @@ class AccountManager:
                     except FloodWaitError as e:
                         wait_time = e.seconds
                         logger.warning(f"Flood wait during password for {phone_number}: {wait_time} seconds")
-                        await client.disconnect()
+                        if client:
+                            await client.disconnect()
+                        if phone_number in self.active_clients:
+                            del self.active_clients[phone_number]
                         return {
                             'status': 'flood_wait',
                             'phone': phone_number,
@@ -250,7 +286,10 @@ class AccountManager:
                         
                     except Exception as e:
                         logger.error(f"Error during password sign in for {phone_number}: {e}")
-                        await client.disconnect()
+                        if client:
+                            await client.disconnect()
+                        if phone_number in self.active_clients:
+                            del self.active_clients[phone_number]
                         return {
                             'status': 'password_error',
                             'phone': phone_number,
@@ -279,9 +318,10 @@ class AccountManager:
                     del self.phone_code_hashes[phone_number]
                 if phone_number in self.login_attempts:
                     del self.login_attempts[phone_number]
+                if phone_number in self.active_clients:
+                    del self.active_clients[phone_number]
                 
                 # Remove the file-based session
-                session_file = session_path + '.session'
                 if os.path.exists(session_file):
                     os.remove(session_file)
                 
@@ -295,7 +335,8 @@ class AccountManager:
                 
             except Exception as e:
                 logger.error(f"Error saving account {phone_number} to database: {e}")
-                await client.disconnect()
+                if client:
+                    await client.disconnect()
                 return {
                     'status': 'error',
                     'phone': phone_number,
@@ -304,6 +345,11 @@ class AccountManager:
             
         except Exception as e:
             logger.error(f"Unexpected error adding account {phone_number}: {e}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
             return {
                 'status': 'error', 
                 'phone': phone_number, 
@@ -311,16 +357,30 @@ class AccountManager:
             }
     
     async def resend_code(self, phone_number):
-        """Resend verification code"""
+        """Resend verification code with complete cleanup"""
         try:
-            # Clean up old attempt
+            # Complete cleanup of all existing data for this phone
             if phone_number in self.phone_code_hashes:
                 del self.phone_code_hashes[phone_number]
             if phone_number in self.login_attempts:
                 del self.login_attempts[phone_number]
+            if phone_number in self.active_clients:
+                try:
+                    await self.active_clients[phone_number].disconnect()
+                except:
+                    pass
+                del self.active_clients[phone_number]
+            
+            # Remove any existing session files
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
+            if os.path.exists(session_file):
+                os.remove(session_file)
+            
+            # Add a delay to ensure Telegram's block is cleared
+            await asyncio.sleep(3)
             
             # Request new code
-            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
             client = TelegramClient(session_path, API_ID, API_HASH)
             await client.connect()
             
@@ -335,11 +395,23 @@ class AccountManager:
             
             await client.disconnect()
             
+            logger.info(f"New code sent successfully to {phone_number}")
+            
             return {
                 'status': 'code_sent',
                 'phone': phone_number,
                 'phone_code_hash': result.phone_code_hash,
-                'message': 'New verification code sent.'
+                'message': 'New verification code sent. Please enter it within 2 minutes.'
+            }
+            
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
+            return {
+                'status': 'flood_wait',
+                'phone': phone_number,
+                'wait_time': wait_time,
+                'message': f'Too many attempts. Please wait {wait_time} seconds.'
             }
             
         except Exception as e:
@@ -349,6 +421,35 @@ class AccountManager:
                 'phone': phone_number,
                 'error': str(e)
             }
+    
+    async def cancel_login(self, phone_number):
+        """Cancel an ongoing login attempt and clean up"""
+        try:
+            if phone_number in self.active_clients:
+                try:
+                    await self.active_clients[phone_number].disconnect()
+                except:
+                    pass
+                del self.active_clients[phone_number]
+            
+            if phone_number in self.phone_code_hashes:
+                del self.phone_code_hashes[phone_number]
+            
+            if phone_number in self.login_attempts:
+                del self.login_attempts[phone_number]
+            
+            # Remove session file
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
+            if os.path.exists(session_file):
+                os.remove(session_file)
+            
+            logger.info(f"Cancelled login for {phone_number}")
+            return {'status': 'success'}
+            
+        except Exception as e:
+            logger.error(f"Error cancelling login for {phone_number}: {e}")
+            return {'status': 'error', 'error': str(e)}
     
     async def get_available_accounts(self, limit=5):
         """Get available accounts for reporting"""
