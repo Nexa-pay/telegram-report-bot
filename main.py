@@ -7,6 +7,7 @@ from reporter import Reporter
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
 import asyncio
 from datetime import datetime
+from sqlalchemy import text
 
 # Enable logging
 logging.basicConfig(
@@ -24,23 +25,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user = update.effective_user
     
-    # Check if user exists
-    db_user = session.query(User).filter_by(user_id=user.id).first()
-    if not db_user:
-        role = 'owner' if user.id == OWNER_ID else 'user'
-        db_user = User(
-            user_id=user.id,
-            username=user.username,
-            tokens=999999 if role == 'owner' else DEFAULT_TOKENS,
-            role=role
-        )
-        session.add(db_user)
+    try:
+        # Check if user exists with proper error handling
+        db_user = session.query(User).filter_by(user_id=user.id).first()
+        
+        if not db_user:
+            role = 'owner' if user.id == OWNER_ID else 'user'
+            db_user = User(
+                user_id=user.id,
+                username=user.username,
+                tokens=999999 if role == 'owner' else DEFAULT_TOKENS,
+                role=role
+            )
+            session.add(db_user)
+            session.commit()
+            logger.info(f"New user registered: {user.id} - {user.username} - Role: {role}")
+        
+        # Update last active
+        db_user.last_active = datetime.utcnow()
         session.commit()
-        logger.info(f"New user registered: {user.id} - {user.username} - Role: {role}")
-    
-    # Update last active
-    db_user.last_active = datetime.utcnow()
-    session.commit()
+        
+    except Exception as e:
+        logger.error(f"Database error in start: {e}")
+        session.rollback()
+        await update.message.reply_text("❌ Database error. Please try again later.")
+        return
     
     # Create main menu
     keyboard = [
@@ -80,15 +89,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = query.from_user.id
-    db_user = session.query(User).filter_by(user_id=user_id).first()
     
-    if not db_user:
-        await query.edit_message_text("❌ User not found. Please use /start to register.")
+    try:
+        db_user = session.query(User).filter_by(user_id=user_id).first()
+        
+        if not db_user:
+            await query.edit_message_text("❌ User not found. Please use /start to register.")
+            return
+        
+        # Update last active
+        db_user.last_active = datetime.utcnow()
+        session.commit()
+        
+    except Exception as e:
+        logger.error(f"Database error in button_handler: {e}")
+        session.rollback()
+        await query.edit_message_text("❌ Database error. Please try again.")
         return
-    
-    # Update last active
-    db_user.last_active = datetime.utcnow()
-    session.commit()
     
     if query.data == 'stats':
         stats_text = f"""
@@ -194,27 +211,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     elif query.data == 'my_reports':
-        reports = session.query(Report).filter_by(reported_by=user_id).order_by(Report.created_at.desc()).limit(10).all()
-        
-        if not reports:
+        try:
+            reports = session.query(Report).filter_by(reported_by=user_id).order_by(Report.created_at.desc()).limit(10).all()
+            
+            if not reports:
+                keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("📭 You haven't made any reports yet.", reply_markup=reply_markup)
+                return
+            
+            text = "📋 **Your Recent Reports:**\n\n"
+            for report in reports:
+                status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
+                text += f"{status_emoji} **ID:** `{report.id}`\n"
+                text += f"   **Target:** `{report.target_username or report.target_id}`\n"
+                text += f"   **Category:** {report.category}\n"
+                text += f"   **Status:** {report.status}\n"
+                text += f"   **Date:** {report.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+                text += "━━━━━━━━━━━━━━━━━━━━━\n"
+            
             keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text("📭 You haven't made any reports yet.", reply_markup=reply_markup)
-            return
-        
-        text = "📋 **Your Recent Reports:**\n\n"
-        for report in reports:
-            status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
-            text += f"{status_emoji} **ID:** `{report.id}`\n"
-            text += f"   **Target:** `{report.target_username or report.target_id}`\n"
-            text += f"   **Category:** {report.category}\n"
-            text += f"   **Status:** {report.status}\n"
-            text += f"   **Date:** {report.created_at.strftime('%Y-%m-%d %H:%M')}\n"
-            text += "━━━━━━━━━━━━━━━━━━━━━\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error fetching reports: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error fetching reports. Please try again.")
         
     elif query.data == 'add_account':
         await query.edit_message_text(
@@ -273,21 +296,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⛔ **Access Denied!**\n\nYou don't have permission to access this panel.")
             return
         
-        total_users = session.query(User).count()
-        total_accounts = session.query(TelegramAccount).count()
-        active_accounts = session.query(TelegramAccount).filter_by(is_active=True).count()
-        pending_reports = session.query(Report).filter_by(status='pending').count()
-        
-        keyboard = [
-            [InlineKeyboardButton("👥 Users", callback_data='admin_users')],
-            [InlineKeyboardButton("📱 Accounts", callback_data='admin_accounts')],
-            [InlineKeyboardButton("📊 Reports", callback_data='admin_reports')],
-            [InlineKeyboardButton("💰 Give Tokens", callback_data='admin_give_tokens')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = f"""
+        try:
+            total_users = session.query(User).count()
+            total_accounts = session.query(TelegramAccount).count()
+            active_accounts = session.query(TelegramAccount).filter_by(is_active=True).count()
+            pending_reports = session.query(Report).filter_by(status='pending').count()
+            
+            keyboard = [
+                [InlineKeyboardButton("👥 Users", callback_data='admin_users')],
+                [InlineKeyboardButton("📱 Accounts", callback_data='admin_accounts')],
+                [InlineKeyboardButton("📊 Reports", callback_data='admin_reports')],
+                [InlineKeyboardButton("💰 Give Tokens", callback_data='admin_give_tokens')],
+                [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            text = f"""
 ⚙️ **Admin Panel**
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -299,7 +323,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⏳ Pending Reports: `{pending_reports}`
 ━━━━━━━━━━━━━━━━━━━━━
 """
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in admin_panel: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading admin panel. Please try again.")
     
     # ADMIN PANEL SUBMENUS
     elif query.data == 'admin_users':
@@ -307,44 +336,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⛔ Access Denied!")
             return
         
-        users = session.query(User).order_by(User.joined_date.desc()).limit(10).all()
-        text = "👥 **Recent Users:**\n\n"
-        for user in users:
-            text += f"🆔 `{user.user_id}` | @{user.username or 'N/A'} | {user.role} | {user.tokens} tokens\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        try:
+            users = session.query(User).order_by(User.joined_date.desc()).limit(10).all()
+            text = "👥 **Recent Users:**\n\n"
+            for user in users:
+                text += f"🆔 `{user.user_id}` | @{user.username or 'N/A'} | {user.role} | {user.tokens} tokens\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in admin_users: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading users. Please try again.")
     
     elif query.data == 'admin_accounts':
         if db_user.role not in ['owner', 'admin']:
             await query.edit_message_text("⛔ Access Denied!")
             return
         
-        accounts = session.query(TelegramAccount).limit(10).all()
-        text = "📱 **Telegram Accounts:**\n\n"
-        for acc in accounts:
-            status_emoji = "✅" if acc.is_active else "❌"
-            text += f"{status_emoji} `{acc.phone_number}` | Reports: {acc.reports_count} | Status: {acc.status}\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        try:
+            accounts = session.query(TelegramAccount).limit(10).all()
+            text = "📱 **Telegram Accounts:**\n\n"
+            for acc in accounts:
+                status_emoji = "✅" if acc.is_active else "❌"
+                text += f"{status_emoji} `{acc.phone_number}` | Reports: {acc.reports_count} | Status: {acc.status}\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in admin_accounts: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading accounts. Please try again.")
     
     elif query.data == 'admin_reports':
         if db_user.role not in ['owner', 'admin']:
             await query.edit_message_text("⛔ Access Denied!")
             return
         
-        reports = session.query(Report).order_by(Report.created_at.desc()).limit(10).all()
-        text = "📊 **Recent Reports:**\n\n"
-        for report in reports:
-            status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
-            text += f"{status_emoji} ID: `{report.id}` | Target: {report.target_username or report.target_id} | Status: {report.status}\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        try:
+            reports = session.query(Report).order_by(Report.created_at.desc()).limit(10).all()
+            text = "📊 **Recent Reports:**\n\n"
+            for report in reports:
+                status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
+                text += f"{status_emoji} ID: `{report.id}` | Target: {report.target_username or report.target_id} | Status: {report.status}\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in admin_reports: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading reports. Please try again.")
     
     elif query.data == 'admin_give_tokens':
         if db_user.role not in ['owner', 'admin']:
@@ -407,16 +454,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⛔ Access Denied!")
             return
         
-        total_users = session.query(User).count()
-        total_accounts = session.query(TelegramAccount).count()
-        total_reports = session.query(Report).count()
-        pending_reports = session.query(Report).filter_by(status='pending').count()
-        completed_reports = session.query(Report).filter_by(status='completed').count()
-        
-        # Get account stats
-        account_stats = await account_manager.get_account_stats()
-        
-        text = f"""
+        try:
+            total_users = session.query(User).count()
+            total_accounts = session.query(TelegramAccount).count()
+            total_reports = session.query(Report).count()
+            pending_reports = session.query(Report).filter_by(status='pending').count()
+            completed_reports = session.query(Report).filter_by(status='completed').count()
+            
+            # Get account stats
+            account_stats = await account_manager.get_account_stats()
+            
+            text = f"""
 📊 **System Statistics**
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -431,9 +479,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
    └─ Completed: `{completed_reports}`
 ━━━━━━━━━━━━━━━━━━━━━
 """
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='owner_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='owner_panel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in owner_stats: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading statistics. Please try again.")
     
     elif query.data == 'owner_settings':
         if db_user.role != 'owner':
@@ -482,8 +535,12 @@ Settings can be changed in config.py
             )
             
             # Update user's report count
-            db_user.reports_made += success_count
-            session.commit()
+            try:
+                db_user.reports_made += success_count
+                session.commit()
+            except Exception as e:
+                logger.error(f"Error updating report count: {e}")
+                session.rollback()
         else:
             keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -500,38 +557,44 @@ Settings can be changed in config.py
         context.user_data.clear()
         
         # Get fresh user data
-        db_user = session.query(User).filter_by(user_id=user_id).first()
-        if not db_user:
-            await query.edit_message_text("❌ User not found. Please use /start to register.")
-            return
-        
-        # Create main menu
-        keyboard = [
-            [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
-            [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
-            [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
-            [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
-            [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
-        ]
-        
-        if db_user.role in ['owner', 'admin']:
-            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
-        if db_user.role == 'owner':
-            keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"🌟 **Welcome back!** 🌟\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 **Tokens:** `{db_user.tokens}`\n"
-            f"👤 **Role:** `{db_user.role}`\n"
-            f"📊 **Reports:** `{db_user.reports_made}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Select an option below:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+        try:
+            db_user = session.query(User).filter_by(user_id=user_id).first()
+            if not db_user:
+                await query.edit_message_text("❌ User not found. Please use /start to register.")
+                return
+            
+            # Create main menu
+            keyboard = [
+                [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
+                [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
+                [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
+                [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
+                [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
+            ]
+            
+            if db_user.role in ['owner', 'admin']:
+                keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
+            if db_user.role == 'owner':
+                keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"🌟 **Welcome back!** 🌟\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 **Tokens:** `{db_user.tokens}`\n"
+                f"👤 **Role:** `{db_user.role}`\n"
+                f"📊 **Reports:** `{db_user.reports_made}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Select an option below:",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in back_to_main: {e}")
+            session.rollback()
+            await query.edit_message_text("❌ Error loading main menu. Please use /start")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
@@ -565,6 +628,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Invalid amount! Please enter a number.")
         except Exception as e:
+            logger.error(f"Error in token gift: {e}")
+            session.rollback()
             await update.message.reply_text(f"❌ Error: {str(e)}")
         
         context.user_data.clear()
@@ -604,6 +669,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Invalid amount! Please enter a number.")
         except Exception as e:
+            logger.error(f"Error in owner token add: {e}")
+            session.rollback()
             await update.message.reply_text(f"❌ Error: {str(e)}")
         
         context.user_data.clear()
@@ -629,6 +696,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID! Please enter a number.")
         except Exception as e:
+            logger.error(f"Error in admin add: {e}")
+            session.rollback()
             await update.message.reply_text(f"❌ Error: {str(e)}")
         
         context.user_data.clear()
@@ -806,36 +875,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Check tokens
-        db_user = session.query(User).filter_by(user_id=user_id).first()
-        if not db_user:
-            await update.message.reply_text("❌ User not found. Please use /start to register.")
-            return
-        
-        required_tokens = len(targets) * REPORT_COST
-        if db_user.role != 'owner' and db_user.tokens < required_tokens:
-            await update.message.reply_text(
-                f"❌ **Insufficient Tokens!**\n\n"
-                f"Required: `{required_tokens}` tokens\n"
-                f"Your balance: `{db_user.tokens}` tokens\n\n"
-                f"Please purchase more tokens from the menu."
-            )
-            return
-        
-        # Send confirmation
-        category = context.user_data.get('report_category')
-        report_text = context.user_data.get('report_text')
-        
-        if not category or not report_text:
-            await update.message.reply_text("❌ Missing report information. Please start over.")
-            context.user_data.clear()
-            return
-        
-        # Format targets list for display
-        targets_display = "\n".join([f"• `{t.get('username') or t.get('id')}`" for t in targets[:5]])
-        if len(targets) > 5:
-            targets_display += f"\n• ... and {len(targets) - 5} more"
-        
-        confirm_text = f"""
+        try:
+            db_user = session.query(User).filter_by(user_id=user_id).first()
+            if not db_user:
+                await update.message.reply_text("❌ User not found. Please use /start to register.")
+                return
+            
+            required_tokens = len(targets) * REPORT_COST
+            if db_user.role != 'owner' and db_user.tokens < required_tokens:
+                await update.message.reply_text(
+                    f"❌ **Insufficient Tokens!**\n\n"
+                    f"Required: `{required_tokens}` tokens\n"
+                    f"Your balance: `{db_user.tokens}` tokens\n\n"
+                    f"Please purchase more tokens from the menu."
+                )
+                return
+            
+            # Send confirmation
+            category = context.user_data.get('report_category')
+            report_text = context.user_data.get('report_text')
+            
+            if not category or not report_text:
+                await update.message.reply_text("❌ Missing report information. Please start over.")
+                context.user_data.clear()
+                return
+            
+            # Format targets list for display
+            targets_display = "\n".join([f"• `{t.get('username') or t.get('id')}`" for t in targets[:5]])
+            if len(targets) > 5:
+                targets_display += f"\n• ... and {len(targets) - 5} more"
+            
+            confirm_text = f"""
 📝 **Report Confirmation**
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -851,20 +921,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Proceed with reporting?
 """
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Yes, Proceed", callback_data='confirm_report'),
-                InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Proceed", callback_data='confirm_report'),
+                    InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')
+                ]
             ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        context.user_data['targets'] = targets
-        await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode='Markdown')
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            context.user_data['targets'] = targets
+            await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in target handling: {e}")
+            session.rollback()
+            await update.message.reply_text("❌ Error processing request. Please try again.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
+    
+    # Rollback database session on error
+    try:
+        session.rollback()
+    except:
+        pass
     
     try:
         if update and update.callback_query:
