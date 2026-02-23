@@ -5,12 +5,25 @@ load_dotenv()
 
 # Bot Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-API_ID = int(os.getenv('API_ID', '0'))
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is not set!")
+
+# API_ID must be integer
+try:
+    API_ID = int(os.getenv('API_ID', '0'))
+    if API_ID == 0:
+        raise ValueError("API_ID is not set or invalid!")
+except ValueError:
+    raise ValueError("API_ID must be a number!")
+
 API_HASH = os.getenv('API_HASH')
+if not API_HASH:
+    raise ValueError("API_HASH is not set!")
+
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 
-# Force SQLite - ignore any DATABASE_URL from Railway
-DATABASE_URL = 'sqlite:///bot.db'
+# Database URL - Railway will provide this
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
 
 # Report Categories
 REPORT_CATEGORIES = {
