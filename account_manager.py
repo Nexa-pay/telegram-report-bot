@@ -16,8 +16,8 @@ import time
 import asyncio
 from config import API_ID, API_HASH
 
-# Create sessions directory if it doesn't exist
-SESSIONS_DIR = 'sessions'
+# Create sessions directory in /tmp for Railway (writable)
+SESSIONS_DIR = '/tmp/telegram_sessions'
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
@@ -25,26 +25,53 @@ logger = logging.getLogger(__name__)
 
 class AccountManager:
     def __init__(self):
-        self.session = Session()
+        self.db_session = Session()
         # Store active clients and their data
         self.active_sessions = {}  # phone -> {client, phone_code_hash, created_at}
         
     async def add_account(self, phone_number, verification_code=None, password=None):
         """Add a new Telegram account for reporting"""
+        client = None
         try:
-            # Clean phone number
-            clean_phone = phone_number.replace('+', '')
+            # Clean phone number for filename
+            clean_phone = phone_number.replace('+', '').replace(' ', '')
             session_path = os.path.join(SESSIONS_DIR, clean_phone)
             session_file = session_path + '.session'
             
             # Remove old session file if it exists
             if os.path.exists(session_file):
-                os.remove(session_file)
-                logger.info(f"Removed old session file for {phone_number}")
+                try:
+                    os.remove(session_file)
+                    logger.info(f"Removed old session file for {phone_number}")
+                except:
+                    pass
             
-            # Create new client
-            client = TelegramClient(session_path, API_ID, API_HASH)
-            await client.connect()
+            # Check for existing active session
+            if phone_number in self.active_sessions:
+                session_data = self.active_sessions[phone_number]
+                client = session_data.get('client')
+                
+                # Check if session is still valid (less than 3 minutes old)
+                if time.time() - session_data.get('created_at', 0) > 180:
+                    # Session too old, clean up
+                    try:
+                        if client:
+                            await client.disconnect()
+                    except:
+                        pass
+                    del self.active_sessions[phone_number]
+                    client = None
+                elif client and not client.is_connected():
+                    # Try to reconnect
+                    try:
+                        await client.connect()
+                    except:
+                        client = None
+            
+            # Create new client if needed
+            if not client:
+                client = TelegramClient(session_path, API_ID, API_HASH)
+                await client.connect()
             
             # Check if already authorized
             if await client.is_user_authorized():
@@ -71,7 +98,6 @@ class AccountManager:
                     return {
                         'status': 'code_sent',
                         'phone': phone_number,
-                        'phone_code_hash': result.phone_code_hash,
                         'message': 'Verification code sent. Please enter it within 2 minutes.'
                     }
                     
@@ -79,6 +105,8 @@ class AccountManager:
                     wait_time = e.seconds
                     logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
                     await client.disconnect()
+                    if phone_number in self.active_sessions:
+                        del self.active_sessions[phone_number]
                     return {
                         'status': 'flood_wait',
                         'phone': phone_number,
@@ -125,7 +153,10 @@ class AccountManager:
                     await client.disconnect()
                     del self.active_sessions[phone_number]
                     if os.path.exists(session_file):
-                        os.remove(session_file)
+                        try:
+                            os.remove(session_file)
+                        except:
+                            pass
                     return {
                         'status': 'code_expired',
                         'phone': phone_number,
@@ -164,7 +195,10 @@ class AccountManager:
                     await client.disconnect()
                     del self.active_sessions[phone_number]
                     if os.path.exists(session_file):
-                        os.remove(session_file)
+                        try:
+                            os.remove(session_file)
+                        except:
+                            pass
                     return {
                         'status': 'code_expired',
                         'phone': phone_number,
@@ -205,8 +239,14 @@ class AccountManager:
                 
                 # Check if client is still connected
                 if not client.is_connected():
-                    logger.warning(f"Client disconnected for {phone_number}, reconnecting...")
-                    await client.connect()
+                    try:
+                        await client.connect()
+                    except:
+                        return {
+                            'status': 'error',
+                            'phone': phone_number,
+                            'error': 'Connection lost. Please start over.'
+                        }
                 
                 try:
                     logger.info(f"Attempting to sign in {phone_number} with password")
@@ -246,6 +286,11 @@ class AccountManager:
             
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
             return {
                 'status': 'error',
                 'phone': phone_number,
@@ -258,16 +303,24 @@ class AccountManager:
             # Get session string
             session_string = StringSession.save(client.session)
             
-            # Save to database
-            account = TelegramAccount(
-                phone_number=phone_number,
-                session_string=session_string,
-                is_active=True,
-                status='available'
-            )
-            self.session.add(account)
-            self.session.commit()
+            # Check if account already exists
+            existing = self.db_session.query(TelegramAccount).filter_by(phone_number=phone_number).first()
+            if existing:
+                # Update existing
+                existing.session_string = session_string
+                existing.is_active = True
+                existing.status = 'available'
+            else:
+                # Create new
+                account = TelegramAccount(
+                    phone_number=phone_number,
+                    session_string=session_string,
+                    is_active=True,
+                    status='available'
+                )
+                self.db_session.add(account)
             
+            self.db_session.commit()
             logger.info(f"Successfully added account: {phone_number}")
             
             # Clean up
@@ -279,7 +332,10 @@ class AccountManager:
             
             # Remove session file
             if os.path.exists(session_file):
-                os.remove(session_file)
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
             
             return {
                 'status': 'success',
@@ -297,7 +353,7 @@ class AccountManager:
             }
     
     async def resend_code(self, phone_number):
-        """Resend verification code"""
+        """Resend verification code with complete cleanup"""
         try:
             # Clean up existing session for this phone
             if phone_number in self.active_sessions:
@@ -308,10 +364,13 @@ class AccountManager:
                 del self.active_sessions[phone_number]
             
             # Remove session file
-            clean_phone = phone_number.replace('+', '')
+            clean_phone = phone_number.replace('+', '').replace(' ', '')
             session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
             if os.path.exists(session_file):
-                os.remove(session_file)
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
             
             # Wait a bit to ensure cleanup
             await asyncio.sleep(2)
@@ -336,7 +395,6 @@ class AccountManager:
             return {
                 'status': 'code_sent',
                 'phone': phone_number,
-                'phone_code_hash': result.phone_code_hash,
                 'message': 'New verification code sent. Please enter it within 2 minutes.'
             }
             
@@ -369,10 +427,13 @@ class AccountManager:
                 del self.active_sessions[phone_number]
             
             # Remove session file
-            clean_phone = phone_number.replace('+', '')
+            clean_phone = phone_number.replace('+', '').replace(' ', '')
             session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
             if os.path.exists(session_file):
-                os.remove(session_file)
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
             
             logger.info(f"Cancelled login for {phone_number}")
             return {'status': 'success'}
@@ -384,7 +445,7 @@ class AccountManager:
     async def get_available_accounts(self, limit=5):
         """Get available accounts for reporting"""
         try:
-            accounts = self.session.query(TelegramAccount).filter_by(
+            accounts = self.db_session.query(TelegramAccount).filter_by(
                 is_active=True, 
                 status='available'
             ).limit(limit).all()
@@ -408,7 +469,7 @@ class AccountManager:
             # Check if client is authorized
             if not await client.is_user_authorized():
                 account.is_active = False
-                self.session.commit()
+                self.db_session.commit()
                 return {'status': 'failed', 'reason': 'account_not_authorized'}
             
             # Get the target entity
@@ -463,7 +524,7 @@ This content is illegal and should be removed immediately.
             if report_sent:
                 account.status = 'available'
                 account.reports_count += 1
-                self.session.commit()
+                self.db_session.commit()
                 return {'status': 'success'}
             else:
                 return {'status': 'failed', 'reason': 'report_methods_failed'}
@@ -474,14 +535,14 @@ This content is illegal and should be removed immediately.
                 await client.disconnect()
             try:
                 account.status = 'available'
-                self.session.commit()
+                self.db_session.commit()
             except:
                 pass
             return {'status': 'failed', 'reason': str(e)}
     
     async def check_account_status(self, account_id):
         """Check if an account is still valid"""
-        account = self.session.query(TelegramAccount).filter_by(id=account_id).first()
+        account = self.db_session.query(TelegramAccount).filter_by(id=account_id).first()
         if not account:
             return {'status': 'error', 'reason': 'account_not_found'}
         
@@ -494,7 +555,7 @@ This content is illegal and should be removed immediately.
                 return {'status': 'active'}
             else:
                 account.is_active = False
-                self.session.commit()
+                self.db_session.commit()
                 await client.disconnect()
                 return {'status': 'inactive'}
                 
@@ -505,10 +566,10 @@ This content is illegal and should be removed immediately.
     async def remove_account(self, account_id):
         """Remove an account from the system"""
         try:
-            account = self.session.query(TelegramAccount).filter_by(id=account_id).first()
+            account = self.db_session.query(TelegramAccount).filter_by(id=account_id).first()
             if account:
-                self.session.delete(account)
-                self.session.commit()
+                self.db_session.delete(account)
+                self.db_session.commit()
                 return {'status': 'success'}
             return {'status': 'error', 'reason': 'account_not_found'}
         except Exception as e:
@@ -518,10 +579,10 @@ This content is illegal and should be removed immediately.
     async def get_account_stats(self):
         """Get statistics about all accounts"""
         try:
-            total = self.session.query(TelegramAccount).count()
-            active = self.session.query(TelegramAccount).filter_by(is_active=True).count()
-            available = self.session.query(TelegramAccount).filter_by(status='available', is_active=True).count()
-            banned = self.session.query(TelegramAccount).filter_by(is_active=False).count()
+            total = self.db_session.query(TelegramAccount).count()
+            active = self.db_session.query(TelegramAccount).filter_by(is_active=True).count()
+            available = self.db_session.query(TelegramAccount).filter_by(status='available', is_active=True).count()
+            banned = self.db_session.query(TelegramAccount).filter_by(is_active=False).count()
             
             return {
                 'total': total,
