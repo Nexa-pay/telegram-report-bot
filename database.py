@@ -1,7 +1,8 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 from datetime import datetime
 import json
 
@@ -35,7 +36,7 @@ class User(Base):
     __tablename__ = 'users'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, unique=True)
+    user_id = Column(BigInteger, unique=True)  # Changed to BigInteger for large Telegram IDs
     username = Column(String, nullable=True)
     tokens = Column(Integer, default=10)
     role = Column(String, default='user')  # 'owner', 'admin', 'user'
@@ -51,7 +52,7 @@ class TelegramAccount(Base):
     phone_number = Column(String, unique=True)
     session_string = Column(Text)
     is_active = Column(Boolean, default=True)
-    added_by = Column(Integer, nullable=True)
+    added_by = Column(BigInteger, nullable=True)  # Changed to BigInteger
     added_date = Column(DateTime, default=datetime.utcnow)
     reports_count = Column(Integer, default=0)
     status = Column(String, default='available')  # 'available', 'busy', 'banned'
@@ -65,7 +66,7 @@ class Report(Base):
     target_username = Column(String, nullable=True)
     category = Column(String)
     custom_text = Column(Text)
-    reported_by = Column(Integer)
+    reported_by = Column(BigInteger)  # Changed to BigInteger
     accounts_used = Column(Text, nullable=True)  # JSON string
     status = Column(String, default='pending')  # 'pending', 'completed', 'failed'
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -75,7 +76,7 @@ class Transaction(Base):
     __tablename__ = 'transactions'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer)
+    user_id = Column(BigInteger)  # Changed to BigInteger
     amount = Column(Integer)
     type = Column(String)  # 'purchase', 'reward', 'deduction'
     description = Column(String, nullable=True)
@@ -88,10 +89,10 @@ def init_db():
         Base.metadata.create_all(engine)
         print("✅ Database tables created successfully!")
         
-        # Create a test session to verify
-        session = Session()
-        session.execute("SELECT 1")
-        session.close()
+        # Create a test session to verify - FIXED: using text()
+        db_session = Session()
+        db_session.execute(text("SELECT 1"))
+        db_session.close()
         print("✅ Database connection verified!")
         
     except Exception as e:
