@@ -1,20 +1,32 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Float, JSON, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import json
 
-# FORCE SQLITE - Ignore any DATABASE_URL from Railway
-# This will work immediately
-DATABASE_URL = 'sqlite:///bot.db'
+# Get database URL from environment
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
 
-# Create engine with SQLite
-engine = create_engine(
-    DATABASE_URL, 
-    connect_args={'check_same_thread': False},  # Needed for SQLite
-    echo=True  # This will show SQL queries in logs (optional)
-)
+# Fix for Railway PostgreSQL
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+# Create engine with proper settings
+if DATABASE_URL.startswith('sqlite'):
+    # For SQLite (development)
+    engine = create_engine(
+        DATABASE_URL, 
+        connect_args={'check_same_thread': False}
+    )
+else:
+    # For PostgreSQL (production)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True
+    )
 
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
@@ -37,7 +49,7 @@ class TelegramAccount(Base):
     
     id = Column(Integer, primary_key=True)
     phone_number = Column(String, unique=True)
-    session_string = Column(Text)  # Changed to Text for longer strings
+    session_string = Column(Text)
     is_active = Column(Boolean, default=True)
     added_by = Column(Integer, nullable=True)
     added_date = Column(DateTime, default=datetime.utcnow)
@@ -52,9 +64,9 @@ class Report(Base):
     target_id = Column(String, nullable=True)
     target_username = Column(String, nullable=True)
     category = Column(String)
-    custom_text = Column(Text)  # Changed to Text for longer text
+    custom_text = Column(Text)
     reported_by = Column(Integer)
-    accounts_used = Column(Text, nullable=True)  # JSON string as Text
+    accounts_used = Column(Text, nullable=True)  # JSON string
     status = Column(String, default='pending')  # 'pending', 'completed', 'failed'
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
@@ -74,8 +86,7 @@ def init_db():
     """Initialize database tables"""
     try:
         Base.metadata.create_all(engine)
-        print("✅ Database tables created successfully using SQLite!")
-        print(f"📁 Database file: bot.db")
+        print("✅ Database tables created successfully!")
         
         # Create a test session to verify
         session = Session()
@@ -85,10 +96,10 @@ def init_db():
         
     except Exception as e:
         print(f"❌ Error creating database tables: {e}")
+        print("⚠️  Will continue with existing database...")
 
 # Initialize database on import
 init_db()
 
-# Export session factory
 def get_session():
     return Session()
