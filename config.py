@@ -5,10 +5,12 @@ load_dotenv()
 
 # Bot Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-API_ID = os.getenv('API_ID')
+API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH')
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+
+# Force SQLite - ignore any DATABASE_URL from Railway
+DATABASE_URL = 'sqlite:///bot.db'
 
 # Report Categories
 REPORT_CATEGORIES = {
