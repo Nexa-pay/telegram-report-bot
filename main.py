@@ -1,891 +1,640 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from database import Session, User, TelegramAccount, Report, Transaction
-from account_manager import AccountManager
-from reporter import Reporter
-from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
-import asyncio
-from datetime import datetime
-
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from telethon import TelegramClient
+from telethon.errors import (
+    SessionPasswordNeededError, 
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    FloodWaitError,
+    PhoneNumberInvalidError,
+    PasswordHashInvalidError,
+    PhoneCodeHashEmptyError
 )
+from telethon.sessions import StringSession
+from database import Session, TelegramAccount
+import logging
+import os
+import time
+import asyncio
+from config import API_ID, API_HASH
+
+# Create sessions directory if it doesn't exist
+SESSIONS_DIR = 'sessions'
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize components
-session = Session()
-account_manager = AccountManager()
-reporter = Reporter()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    user = update.effective_user
-    
-    # Check if user exists
-    db_user = session.query(User).filter_by(user_id=user.id).first()
-    if not db_user:
-        role = 'owner' if user.id == OWNER_ID else 'user'
-        db_user = User(
-            user_id=user.id,
-            username=user.username,
-            tokens=999999 if role == 'owner' else DEFAULT_TOKENS,
-            role=role
-        )
-        session.add(db_user)
-        session.commit()
-        logger.info(f"New user registered: {user.id} - {user.username} - Role: {role}")
-    
-    # Update last active
-    db_user.last_active = datetime.utcnow()
-    session.commit()
-    
-    # Create main menu
-    keyboard = [
-        [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
-        [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
-        [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
-        [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
-        [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
-    ]
-    
-    if db_user.role in ['owner', 'admin']:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
-    if db_user.role == 'owner':
-        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = f"""
-🌟 **Welcome {user.first_name}!** 🌟
-
-━━━━━━━━━━━━━━━━━━━━━
-📋 **Your Information**
-━━━━━━━━━━━━━━━━━━━━━
-🆔 ID: `{user.id}`
-💰 Tokens: `{db_user.tokens}`
-👤 Role: `{db_user.role}`
-📊 Reports Made: `{db_user.reports_made}`
-━━━━━━━━━━━━━━━━━━━━━
-
-Select an option below:
-"""
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button presses"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    db_user = session.query(User).filter_by(user_id=user_id).first()
-    
-    if not db_user:
-        await query.edit_message_text("❌ User not found. Please use /start to register.")
-        return
-    
-    # Update last active
-    db_user.last_active = datetime.utcnow()
-    session.commit()
-    
-    if query.data == 'stats':
-        stats_text = f"""
-📊 **Your Statistics**
-
-━━━━━━━━━━━━━━━━━━━━━
-🆔 User ID: `{db_user.user_id}`
-👤 Username: @{db_user.username or 'N/A'}
-💰 Tokens: `{db_user.tokens}`
-👑 Role: `{db_user.role}`
-📊 Reports Made: `{db_user.reports_made}`
-📅 Joined: `{db_user.joined_date.strftime('%Y-%m-%d')}`
-⏰ Last Active: `{db_user.last_active.strftime('%Y-%m-%d %H:%M')}`
-━━━━━━━━━━━━━━━━━━━━━
-"""
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(stats_text, reply_markup=reply_markup, parse_mode='Markdown')
+class AccountManager:
+    def __init__(self):
+        self.session = Session()
+        # Store phone_code_hash temporarily
+        self.phone_code_hashes = {}
+        # Store login attempts to track expiration
+        self.login_attempts = {}
+        # Store active clients for 2FA
+        self.active_clients = {}
         
-    elif query.data == 'report_menu':
-        # Show report categories
-        keyboard = []
-        for key, value in REPORT_CATEGORIES.items():
-            keyboard.append([InlineKeyboardButton(value, callback_data=f'report_cat_{key}')])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_to_main')])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "📝 **Select Report Category**\n\nChoose the type of violation:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-    elif query.data.startswith('report_cat_'):
-        category = query.data.replace('report_cat_', '')
-        context.user_data['report_category'] = category
-        context.user_data['report_template'] = REPORT_TEMPLATES.get(category, "")
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Use Template", callback_data='use_template')],
-            [InlineKeyboardButton("✏️ Custom Text", callback_data='custom_text')],
-            [InlineKeyboardButton("🔙 Back", callback_data='report_menu')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"📋 **Category:** {REPORT_CATEGORIES[category]}\n\n"
-            f"**Template:**\n`{REPORT_TEMPLATES[category]}`\n\n"
-            "Choose an option:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-    elif query.data == 'use_template':
-        context.user_data['report_text'] = context.user_data['report_template']
-        await query.edit_message_text(
-            "📝 **Send Target Information**\n\n"
-            "Please send me the username(s) or ID(s) of the target(s) to report.\n"
-            "You can send multiple by separating with commas or new lines.\n\n"
-            "**Examples:**\n"
-            "• `@spam_channel`\n"
-            "• `-1001234567890`\n"
-            "• `@user1, @user2, @user3`"
-        )
-        context.user_data['awaiting_target'] = True
-        
-    elif query.data == 'custom_text':
-        await query.edit_message_text(
-            "✏️ **Send Custom Report Text**\n\n"
-            "Please write your custom report message.\n"
-            "Be detailed and specific about the violation:"
-        )
-        context.user_data['awaiting_custom_text'] = True
-        
-    elif query.data == 'buy_tokens':
-        keyboard = [
-            [InlineKeyboardButton("🔟 10 Tokens - $1", callback_data='buy_10')],
-            [InlineKeyboardButton("5️⃣0️⃣ 50 Tokens - $4", callback_data='buy_50')],
-            [InlineKeyboardButton("1️⃣0️⃣0️⃣ 100 Tokens - $7", callback_data='buy_100')],
-            [InlineKeyboardButton("5️⃣0️⃣0️⃣ 500 Tokens - $30", callback_data='buy_500')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            f"💰 **Buy Tokens**\n\n"
-            f"Your current tokens: `{db_user.tokens}`\n\n"
-            "Select a package:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-    elif query.data.startswith('buy_'):
-        amount = int(query.data.replace('buy_', ''))
-        # Here you would integrate with payment gateway
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            f"💳 **Purchase {amount} Tokens**\n\n"
-            f"To purchase {amount} tokens, please contact @admin\n\n"
-            "Payment integration coming soon!\n\n"
-            "For now, tokens can be added by admins only.",
-            reply_markup=reply_markup
-        )
-        
-    elif query.data == 'my_reports':
-        reports = session.query(Report).filter_by(reported_by=user_id).order_by(Report.created_at.desc()).limit(10).all()
-        
-        if not reports:
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text("📭 You haven't made any reports yet.", reply_markup=reply_markup)
-            return
-        
-        text = "📋 **Your Recent Reports:**\n\n"
-        for report in reports:
-            status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
-            text += f"{status_emoji} **ID:** `{report.id}`\n"
-            text += f"   **Target:** `{report.target_username or report.target_id}`\n"
-            text += f"   **Category:** {report.category}\n"
-            text += f"   **Status:** {report.status}\n"
-            text += f"   **Date:** {report.created_at.strftime('%Y-%m-%d %H:%M')}\n"
-            text += "━━━━━━━━━━━━━━━━━━━━━\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        
-    elif query.data == 'add_account':
-        await query.edit_message_text(
-            "📱 **Add Telegram Account**\n\n"
-            "Please send me your phone number in international format:\n\n"
-            "**Example:** `+1234567890`\n\n"
-            "⚠️ This account will be used for reporting content."
-        )
-        context.user_data['awaiting_phone'] = True
-        
-    elif query.data == 'resend_code':
-        # Handle code resend
-        phone = context.user_data.get('phone')
-        if phone:
-            await query.edit_message_text("🔄 **Resending verification code...**")
-            result = await account_manager.resend_code(phone)
-            if result['status'] == 'code_sent':
-                context.user_data['phone_code_hash'] = result.get('phone_code_hash')
-                context.user_data['awaiting_code'] = True
-                await query.edit_message_text(
-                    "📱 **New Verification Code Sent!**\n\n"
-                    "Please enter the new 5-digit code:\n"
-                    "**Example:** `12345`\n\n"
-                    "⏰ **Note:** Code expires in 2 minutes."
-                )
-            else:
-                keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"❌ **Error:** {result.get('error', 'Failed to resend code')}\n\n"
-                    "Please try again with /start",
-                    reply_markup=reply_markup
-                )
-        else:
-            await query.edit_message_text("❌ Session expired. Please start over with /start")
-            context.user_data.clear()
-        
-    elif query.data == 'admin_panel':
-        if db_user.role not in ['owner', 'admin']:
-            await query.edit_message_text("⛔ **Access Denied!**\n\nYou don't have permission to access this panel.")
-            return
-        
-        total_users = session.query(User).count()
-        total_accounts = session.query(TelegramAccount).count()
-        active_accounts = session.query(TelegramAccount).filter_by(is_active=True).count()
-        pending_reports = session.query(Report).filter_by(status='pending').count()
-        
-        keyboard = [
-            [InlineKeyboardButton("👥 Users", callback_data='admin_users')],
-            [InlineKeyboardButton("📱 Accounts", callback_data='admin_accounts')],
-            [InlineKeyboardButton("📊 Reports", callback_data='admin_reports')],
-            [InlineKeyboardButton("💰 Give Tokens", callback_data='admin_give_tokens')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = f"""
-⚙️ **Admin Panel**
-
-━━━━━━━━━━━━━━━━━━━━━
-📊 **Statistics**
-━━━━━━━━━━━━━━━━━━━━━
-👥 Total Users: `{total_users}`
-📱 Total Accounts: `{total_accounts}`
-✅ Active Accounts: `{active_accounts}`
-⏳ Pending Reports: `{pending_reports}`
-━━━━━━━━━━━━━━━━━━━━━
-"""
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    # ADMIN PANEL SUBMENUS
-    elif query.data == 'admin_users':
-        if db_user.role not in ['owner', 'admin']:
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        users = session.query(User).order_by(User.joined_date.desc()).limit(10).all()
-        text = "👥 **Recent Users:**\n\n"
-        for user in users:
-            text += f"🆔 `{user.user_id}` | @{user.username or 'N/A'} | {user.role} | {user.tokens} tokens\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    elif query.data == 'admin_accounts':
-        if db_user.role not in ['owner', 'admin']:
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        accounts = session.query(TelegramAccount).limit(10).all()
-        text = "📱 **Telegram Accounts:**\n\n"
-        for acc in accounts:
-            status_emoji = "✅" if acc.is_active else "❌"
-            text += f"{status_emoji} `{acc.phone_number}` | Reports: {acc.reports_count} | Status: {acc.status}\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    elif query.data == 'admin_reports':
-        if db_user.role not in ['owner', 'admin']:
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        reports = session.query(Report).order_by(Report.created_at.desc()).limit(10).all()
-        text = "📊 **Recent Reports:**\n\n"
-        for report in reports:
-            status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
-            text += f"{status_emoji} ID: `{report.id}` | Target: {report.target_username or report.target_id} | Status: {report.status}\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    elif query.data == 'admin_give_tokens':
-        if db_user.role not in ['owner', 'admin']:
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        await query.edit_message_text(
-            "💰 **Give Tokens to User**\n\n"
-            "Please send the user ID and amount in this format:\n"
-            "`USER_ID AMOUNT`\n\n"
-            "Example: `123456789 50`"
-        )
-        context.user_data['awaiting_token_gift'] = True
-    
-    # OWNER PANEL
-    elif query.data == 'owner_panel':
-        if db_user.role != 'owner':
-            await query.edit_message_text("⛔ **Access Denied!**\n\nThis panel is for owner only.")
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("💰 Add Tokens", callback_data='owner_add_tokens')],
-            [InlineKeyboardButton("👑 Add Admin", callback_data='owner_add_admin')],
-            [InlineKeyboardButton("📊 System Stats", callback_data='owner_stats')],
-            [InlineKeyboardButton("⚙️ Settings", callback_data='owner_settings')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text("👑 **Owner Panel**", reply_markup=reply_markup, parse_mode='Markdown')
-    
-    # OWNER PANEL SUBMENUS
-    elif query.data == 'owner_add_tokens':
-        if db_user.role != 'owner':
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        await query.edit_message_text(
-            "💰 **Add Tokens to User**\n\n"
-            "Please send the user ID and amount in this format:\n"
-            "`USER_ID AMOUNT`\n\n"
-            "Example: `123456789 1000`"
-        )
-        context.user_data['awaiting_owner_token_add'] = True
-    
-    elif query.data == 'owner_add_admin':
-        if db_user.role != 'owner':
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        await query.edit_message_text(
-            "👑 **Add Admin**\n\n"
-            "Please send the user ID to make admin:\n"
-            "Example: `123456789`"
-        )
-        context.user_data['awaiting_admin_add'] = True
-    
-    elif query.data == 'owner_stats':
-        if db_user.role != 'owner':
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        total_users = session.query(User).count()
-        total_accounts = session.query(TelegramAccount).count()
-        total_reports = session.query(Report).count()
-        pending_reports = session.query(Report).filter_by(status='pending').count()
-        completed_reports = session.query(Report).filter_by(status='completed').count()
-        
-        # Get account stats
-        account_stats = await account_manager.get_account_stats()
-        
-        text = f"""
-📊 **System Statistics**
-
-━━━━━━━━━━━━━━━━━━━━━
-👥 **Users:** `{total_users}`
-📱 **Accounts:** `{total_accounts}`
-   ├─ Active: `{account_stats['active']}`
-   ├─ Available: `{account_stats['available']}`
-   └─ Banned: `{account_stats['banned']}`
-
-📋 **Reports:** `{total_reports}`
-   ├─ Pending: `{pending_reports}`
-   └─ Completed: `{completed_reports}`
-━━━━━━━━━━━━━━━━━━━━━
-"""
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='owner_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    elif query.data == 'owner_settings':
-        if db_user.role != 'owner':
-            await query.edit_message_text("⛔ Access Denied!")
-            return
-        
-        text = f"""
-⚙️ **Bot Settings**
-
-━━━━━━━━━━━━━━━━━━━━━
-💰 Default Tokens: `{DEFAULT_TOKENS}`
-💳 Report Cost: `{REPORT_COST}` token
-👑 Owner ID: `{OWNER_ID}`
-━━━━━━━━━━━━━━━━━━━━━
-
-Settings can be changed in config.py
-"""
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='owner_panel')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    # REPORT CONFIRMATION
-    elif query.data == 'confirm_report':
-        # Execute reports
-        targets = context.user_data.get('targets', [])
-        category = context.user_data.get('report_category')
-        report_text = context.user_data.get('report_text')
-        
-        if not targets or not category or not report_text:
-            await query.edit_message_text("❌ Missing report information. Please start over.")
-            context.user_data.clear()
-            return
-        
-        await query.edit_message_text("🔄 **Processing reports...**\nThis may take a few minutes.")
-        
-        result = await reporter.bulk_report(targets, category, report_text, user_id)
-        
-        if result['status'] == 'success':
-            success_count = len(result['report_ids'])
-            keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                f"✅ **Successfully submitted {success_count} reports!**\n\n"
-                f"**Report IDs:**\n`{', '.join(map(str, result['report_ids']))}`",
-                reply_markup=reply_markup
-            )
-            
-            # Update user's report count
-            db_user.reports_made += success_count
-            session.commit()
-        else:
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                f"❌ **Error:** {result['message']}",
-                reply_markup=reply_markup
-            )
-        
-        context.user_data.clear()
-    
-    # BACK TO MAIN
-    elif query.data == 'back_to_main':
-        # Clear user data to avoid confusion
-        context.user_data.clear()
-        
-        # Get fresh user data
-        db_user = session.query(User).filter_by(user_id=user_id).first()
-        if not db_user:
-            await query.edit_message_text("❌ User not found. Please use /start to register.")
-            return
-        
-        # Create main menu
-        keyboard = [
-            [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
-            [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
-            [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
-            [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
-            [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
-        ]
-        
-        if db_user.role in ['owner', 'admin']:
-            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
-        if db_user.role == 'owner':
-            keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"🌟 **Welcome back!** 🌟\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 **Tokens:** `{db_user.tokens}`\n"
-            f"👤 **Role:** `{db_user.role}`\n"
-            f"📊 **Reports:** `{db_user.reports_made}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Select an option below:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    # Handle token gifting from admin
-    if context.user_data.get('awaiting_token_gift'):
+    async def add_account(self, phone_number, verification_code=None, password=None, phone_code_hash=None):
+        """Add a new Telegram account for reporting with improved error handling"""
+        client = None
         try:
-            parts = text.split()
-            if len(parts) != 2:
-                await update.message.reply_text("❌ Invalid format! Use: `USER_ID AMOUNT`")
-                return
+            # Clean up any existing session files for this phone
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
             
-            target_user_id = int(parts[0])
-            amount = int(parts[1])
+            # Check if there's an existing login attempt that's too old
+            if phone_number in self.login_attempts:
+                attempt_time = self.login_attempts[phone_number].get('timestamp', 0)
+                if time.time() - attempt_time > 120:  # 2 minutes
+                    # Login attempt expired, remove it and clean up
+                    logger.info(f"Cleaning up expired login attempt for {phone_number}")
+                    del self.login_attempts[phone_number]
+                    if phone_number in self.phone_code_hashes:
+                        del self.phone_code_hashes[phone_number]
+                    if phone_number in self.active_clients:
+                        try:
+                            await self.active_clients[phone_number].disconnect()
+                        except:
+                            pass
+                        del self.active_clients[phone_number]
+                    if os.path.exists(session_file):
+                        os.remove(session_file)
             
-            target_user = session.query(User).filter_by(user_id=target_user_id).first()
-            if not target_user:
-                await update.message.reply_text("❌ User not found!")
-                return
+            # Create new client
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.connect()
             
-            target_user.tokens += amount
-            session.commit()
+            if not await client.is_user_authorized():
+                if not verification_code and not password:
+                    # First step: Request code
+                    try:
+                        logger.info(f"Sending code request to {phone_number}")
+                        
+                        # Add a small delay to avoid rate limiting
+                        await asyncio.sleep(1)
+                        
+                        result = await client.send_code_request(phone_number)
+                        
+                        # Store the phone_code_hash
+                        self.phone_code_hashes[phone_number] = result.phone_code_hash
+                        self.login_attempts[phone_number] = {
+                            'timestamp': time.time(),
+                            'phone_code_hash': result.phone_code_hash
+                        }
+                        
+                        await client.disconnect()
+                        logger.info(f"Code sent successfully to {phone_number}")
+                        
+                        return {
+                            'status': 'code_sent', 
+                            'phone': phone_number,
+                            'phone_code_hash': result.phone_code_hash,
+                            'message': 'Verification code sent. Please enter it within 2 minutes.'
+                        }
+                        
+                    except FloodWaitError as e:
+                        wait_time = e.seconds
+                        logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
+                        await client.disconnect()
+                        return {
+                            'status': 'flood_wait',
+                            'phone': phone_number,
+                            'wait_time': wait_time,
+                            'message': f'Too many attempts. Please wait {wait_time} seconds.'
+                        }
+                        
+                    except PhoneNumberInvalidError:
+                        await client.disconnect()
+                        return {
+                            'status': 'error',
+                            'phone': phone_number,
+                            'error': 'Invalid phone number format. Use international format: +1234567890'
+                        }
+                        
+                    except Exception as e:
+                        await client.disconnect()
+                        logger.error(f"Error sending code to {phone_number}: {e}")
+                        return {
+                            'status': 'error',
+                            'phone': phone_number,
+                            'error': str(e)
+                        }
+                
+                elif verification_code and not password:
+                    # Second step: Sign in with code
+                    try:
+                        logger.info(f"Attempting to sign in {phone_number} with code")
+                        
+                        # Get the stored phone_code_hash
+                        stored_hash = phone_code_hash or self.phone_code_hashes.get(phone_number)
+                        
+                        if not stored_hash:
+                            await client.disconnect()
+                            return {
+                                'status': 'error', 
+                                'message': 'Missing phone_code_hash. Please start over.',
+                                'phone': phone_number
+                            }
+                        
+                        # Check if code expired (older than 2 minutes)
+                        if phone_number in self.login_attempts:
+                            attempt_time = self.login_attempts[phone_number].get('timestamp', 0)
+                            if time.time() - attempt_time > 120:
+                                # Clean up expired attempt
+                                logger.info(f"Code expired for {phone_number}")
+                                del self.login_attempts[phone_number]
+                                if phone_number in self.phone_code_hashes:
+                                    del self.phone_code_hashes[phone_number]
+                                if os.path.exists(session_file):
+                                    os.remove(session_file)
+                                await client.disconnect()
+                                return {
+                                    'status': 'code_expired',
+                                    'phone': phone_number,
+                                    'message': 'Verification code expired. Please start over.'
+                                }
+                        
+                        try:
+                            # Add a small delay
+                            await asyncio.sleep(1)
+                            
+                            await client.sign_in(
+                                phone_number, 
+                                code=verification_code,
+                                phone_code_hash=stored_hash
+                            )
+                            
+                            # If we get here, sign in was successful (no 2FA)
+                            logger.info(f"Code sign in successful for {phone_number}")
+                            
+                        except SessionPasswordNeededError:
+                            # 2FA enabled - store the client for password step
+                            logger.info(f"2FA required for {phone_number}")
+                            
+                            # Store the hash and client for password step
+                            self.phone_code_hashes[phone_number] = stored_hash
+                            self.active_clients[phone_number] = client
+                            
+                            return {
+                                'status': 'password_needed', 
+                                'phone': phone_number,
+                                'phone_code_hash': stored_hash,
+                                'message': 'This account has 2FA enabled. Please enter your password.'
+                            }
+                            
+                        except PhoneCodeExpiredError:
+                            logger.warning(f"Code expired for {phone_number}")
+                            if phone_number in self.login_attempts:
+                                del self.login_attempts[phone_number]
+                            if phone_number in self.phone_code_hashes:
+                                del self.phone_code_hashes[phone_number]
+                            if os.path.exists(session_file):
+                                os.remove(session_file)
+                            await client.disconnect()
+                            return {
+                                'status': 'code_expired',
+                                'phone': phone_number,
+                                'message': 'Verification code expired. Please start over with a new code.'
+                            }
+                            
+                        except PhoneCodeInvalidError:
+                            logger.warning(f"Invalid code for {phone_number}")
+                            await client.disconnect()
+                            return {
+                                'status': 'code_invalid',
+                                'phone': phone_number,
+                                'message': 'Invalid verification code. Please try again.'
+                            }
+                            
+                        except PhoneCodeHashEmptyError:
+                            logger.warning(f"Code hash empty for {phone_number}")
+                            await client.disconnect()
+                            return {
+                                'status': 'error',
+                                'phone': phone_number,
+                                'message': 'Session error. Please start over.'
+                            }
+                            
+                    except FloodWaitError as e:
+                        wait_time = e.seconds
+                        logger.warning(f"Flood wait during sign in for {phone_number}: {wait_time} seconds")
+                        await client.disconnect()
+                        return {
+                            'status': 'flood_wait',
+                            'phone': phone_number,
+                            'wait_time': wait_time,
+                            'message': f'Too many attempts. Please wait {wait_time} seconds.'
+                        }
+                        
+                    except Exception as e:
+                        logger.error(f"Error during sign in for {phone_number}: {e}")
+                        await client.disconnect()
+                        return {
+                            'status': 'error',
+                            'phone': phone_number,
+                            'error': str(e)
+                        }
+                
+                elif password:
+                    # Third step: Sign in with password (2FA)
+                    try:
+                        logger.info(f"Attempting to sign in {phone_number} with password")
+                        
+                        # Get the stored client for this phone number
+                        client = self.active_clients.get(phone_number)
+                        
+                        if not client or not client.is_connected():
+                            logger.info(f"Client not found or disconnected for {phone_number}, starting over")
+                            # Clean up
+                            if phone_number in self.active_clients:
+                                del self.active_clients[phone_number]
+                            if phone_number in self.phone_code_hashes:
+                                del self.phone_code_hashes[phone_number]
+                            if phone_number in self.login_attempts:
+                                del self.login_attempts[phone_number]
+                            if os.path.exists(session_file):
+                                os.remove(session_file)
+                            return {
+                                'status': 'error',
+                                'phone': phone_number,
+                                'error': 'Session expired. Please start over with phone number.'
+                            }
+                        
+                        try:
+                            # Add a small delay
+                            await asyncio.sleep(1)
+                            
+                            await client.sign_in(password=password)
+                            logger.info(f"Password sign in successful for {phone_number}")
+                            
+                        except PasswordHashInvalidError:
+                            logger.warning(f"Invalid password for {phone_number}")
+                            # Keep client alive for retry
+                            return {
+                                'status': 'password_error',
+                                'phone': phone_number,
+                                'error': 'Invalid password'
+                            }
+                            
+                    except FloodWaitError as e:
+                        wait_time = e.seconds
+                        logger.warning(f"Flood wait during password for {phone_number}: {wait_time} seconds")
+                        if client:
+                            await client.disconnect()
+                        if phone_number in self.active_clients:
+                            del self.active_clients[phone_number]
+                        return {
+                            'status': 'flood_wait',
+                            'phone': phone_number,
+                            'wait_time': wait_time,
+                            'message': f'Too many attempts. Please wait {wait_time} seconds.'
+                        }
+                        
+                    except Exception as e:
+                        logger.error(f"Error during password sign in for {phone_number}: {e}")
+                        if client:
+                            await client.disconnect()
+                        if phone_number in self.active_clients:
+                            del self.active_clients[phone_number]
+                        return {
+                            'status': 'password_error',
+                            'phone': phone_number,
+                            'error': str(e)
+                        }
             
-            await update.message.reply_text(
-                f"✅ Added {amount} tokens to user {target_user_id}\n"
-                f"New balance: {target_user.tokens} tokens"
-            )
-            
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount! Please enter a number.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        
-        context.user_data.clear()
-        return
-    
-    # Handle owner adding tokens
-    elif context.user_data.get('awaiting_owner_token_add'):
-        try:
-            parts = text.split()
-            if len(parts) != 2:
-                await update.message.reply_text("❌ Invalid format! Use: `USER_ID AMOUNT`")
-                return
-            
-            target_user_id = int(parts[0])
-            amount = int(parts[1])
-            
-            target_user = session.query(User).filter_by(user_id=target_user_id).first()
-            if not target_user:
-                # Create user if doesn't exist
-                target_user = User(
-                    user_id=target_user_id,
-                    username=f"user_{target_user_id}",
-                    tokens=amount,
-                    role='user'
+            # If we get here, we're successfully authorized
+            try:
+                # Get the session string for database storage
+                session_string = StringSession.save(client.session)
+                
+                # Save to database
+                account = TelegramAccount(
+                    phone_number=phone_number,
+                    session_string=session_string,
+                    is_active=True,
+                    status='available'
                 )
-                session.add(target_user)
-                await update.message.reply_text(f"✅ Created new user and added {amount} tokens")
-            else:
-                target_user.tokens += amount
-                await update.message.reply_text(
-                    f"✅ Added {amount} tokens to user {target_user_id}\n"
-                    f"New balance: {target_user.tokens} tokens"
-                )
+                self.session.add(account)
+                self.session.commit()
+                
+                logger.info(f"Successfully added account: {phone_number}")
+                
+                # Clean up stored data
+                if phone_number in self.phone_code_hashes:
+                    del self.phone_code_hashes[phone_number]
+                if phone_number in self.login_attempts:
+                    del self.login_attempts[phone_number]
+                if phone_number in self.active_clients:
+                    del self.active_clients[phone_number]
+                
+                # Remove the file-based session
+                if os.path.exists(session_file):
+                    os.remove(session_file)
+                
+                await client.disconnect()
+                
+                return {
+                    'status': 'success', 
+                    'phone': phone_number,
+                    'message': 'Account added successfully!'
+                }
+                
+            except Exception as e:
+                logger.error(f"Error saving account {phone_number} to database: {e}")
+                if client:
+                    await client.disconnect()
+                return {
+                    'status': 'error',
+                    'phone': phone_number,
+                    'error': f'Database error: {str(e)}'
+                }
             
-            session.commit()
-            
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount! Please enter a number.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        
-        context.user_data.clear()
-        return
+            logger.error(f"Unexpected error adding account {phone_number}: {e}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return {
+                'status': 'error', 
+                'phone': phone_number, 
+                'error': str(e)
+            }
     
-    # Handle owner adding admin
-    elif context.user_data.get('awaiting_admin_add'):
+    async def resend_code(self, phone_number):
+        """Resend verification code with complete cleanup"""
         try:
-            target_user_id = int(text.strip())
+            # Complete cleanup of all existing data for this phone
+            if phone_number in self.phone_code_hashes:
+                del self.phone_code_hashes[phone_number]
+            if phone_number in self.login_attempts:
+                del self.login_attempts[phone_number]
+            if phone_number in self.active_clients:
+                try:
+                    await self.active_clients[phone_number].disconnect()
+                except:
+                    pass
+                del self.active_clients[phone_number]
             
-            target_user = session.query(User).filter_by(user_id=target_user_id).first()
-            if not target_user:
-                await update.message.reply_text("❌ User not found!")
-                return
+            # Remove any existing session files
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
+            if os.path.exists(session_file):
+                os.remove(session_file)
+                logger.info(f"Removed existing session file for {phone_number}")
             
-            target_user.role = 'admin'
-            session.commit()
+            # Add a delay to ensure Telegram's block is cleared
+            await asyncio.sleep(3)
             
-            await update.message.reply_text(
-                f"✅ User {target_user_id} is now an admin!"
-            )
+            # Request new code
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.connect()
             
-        except ValueError:
-            await update.message.reply_text("❌ Invalid user ID! Please enter a number.")
+            result = await client.send_code_request(phone_number)
+            
+            # Store new phone_code_hash
+            self.phone_code_hashes[phone_number] = result.phone_code_hash
+            self.login_attempts[phone_number] = {
+                'timestamp': time.time(),
+                'phone_code_hash': result.phone_code_hash
+            }
+            
+            await client.disconnect()
+            
+            logger.info(f"New code sent successfully to {phone_number}")
+            
+            return {
+                'status': 'code_sent',
+                'phone': phone_number,
+                'phone_code_hash': result.phone_code_hash,
+                'message': 'New verification code sent. Please enter it within 2 minutes.'
+            }
+            
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
+            return {
+                'status': 'flood_wait',
+                'phone': phone_number,
+                'wait_time': wait_time,
+                'message': f'Too many attempts. Please wait {wait_time} seconds.'
+            }
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        
-        context.user_data.clear()
-        return
+            logger.error(f"Error resending code to {phone_number}: {e}")
+            return {
+                'status': 'error',
+                'phone': phone_number,
+                'error': str(e)
+            }
     
-    # Rest of your existing message handlers...
-    if context.user_data.get('awaiting_phone'):
-        # Handle phone number for account addition
-        phone = text.strip()
-        context.user_data['phone'] = phone
-        context.user_data['awaiting_phone'] = False
-        context.user_data['awaiting_code'] = True
-        
-        await update.message.chat.send_action(action='typing')
-        
-        result = await account_manager.add_account(phone)
-        
-        if result['status'] == 'code_sent':
-            # Store the phone_code_hash
-            context.user_data['phone_code_hash'] = result.get('phone_code_hash')
-            await update.message.reply_text(
-                "📱 **Verification Code Sent!**\n\n"
-                "Please enter the 5-digit code you received:\n"
-                "**Example:** `12345`\n\n"
-                "⏰ **Note:** Code expires in 2 minutes."
-            )
-        elif result['status'] == 'flood_wait':
-            wait_time = result.get('wait_time', 60)
-            await update.message.reply_text(
-                f"⏳ **Too Many Attempts**\n\n"
-                f"Please wait {wait_time} seconds before trying again.\n"
-                f"Your phone number: `{phone}`"
-            )
-            context.user_data.clear()
-        else:
-            await update.message.reply_text(
-                f"❌ **Error:** {result.get('error', 'Unknown error')}\n\n"
-                "Please check your phone number and try again."
-            )
-            context.user_data.clear()
+    async def cancel_login(self, phone_number):
+        """Cancel an ongoing login attempt and clean up"""
+        try:
+            if phone_number in self.active_clients:
+                try:
+                    await self.active_clients[phone_number].disconnect()
+                except:
+                    pass
+                del self.active_clients[phone_number]
             
-    elif context.user_data.get('awaiting_code'):
-        # Handle verification code
-        code = text.strip()
-        phone = context.user_data.get('phone')
-        phone_code_hash = context.user_data.get('phone_code_hash')
-        
-        await update.message.chat.send_action(action='typing')
-        
-        result = await account_manager.add_account(
-            phone, 
-            verification_code=code,
-            phone_code_hash=phone_code_hash
-        )
-        
-        if result['status'] == 'password_needed':
-            context.user_data['awaiting_password'] = True
-            context.user_data['phone_code_hash'] = result.get('phone_code_hash')
-            await update.message.reply_text(
-                "🔐 **Two-Step Verification Enabled**\n\n"
-                "Please enter your account password:"
-            )
-        elif result['status'] == 'code_expired':
-            # Code expired - offer to resend
-            keyboard = [
-                [InlineKeyboardButton("🔄 Resend Code", callback_data='resend_code')],
-                [InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "⏰ **Verification Code Expired**\n\n"
-                "The code you entered has expired. Codes are valid for 2 minutes only.\n\n"
-                "Would you like a new code?",
-                reply_markup=reply_markup
-            )
-        elif result['status'] == 'code_invalid':
-            await update.message.reply_text(
-                "❌ **Invalid Code**\n\n"
-                "The code you entered is incorrect. Please try again:"
-            )
-        elif result['status'] == 'flood_wait':
-            wait_time = result.get('wait_time', 60)
-            await update.message.reply_text(
-                f"⏳ **Too Many Attempts**\n\n"
-                f"Please wait {wait_time} seconds before trying again."
-            )
-        elif result['status'] == 'success':
-            await update.message.reply_text(
-                "✅ **Account Added Successfully!**\n\n"
-                "You can now use this account for reporting."
-            )
-            context.user_data.clear()
-        else:
-            await update.message.reply_text(
-                f"❌ **Error:** {result.get('error', 'Unknown error')}\n\n"
-                "Please try again with /start"
-            )
-            context.user_data.clear()
+            if phone_number in self.phone_code_hashes:
+                del self.phone_code_hashes[phone_number]
             
-    elif context.user_data.get('awaiting_password'):
-        # Handle 2FA password
-        password = text
-        phone = context.user_data.get('phone')
-        phone_code_hash = context.user_data.get('phone_code_hash')
-        
-        await update.message.chat.send_action(action='typing')
-        
-        result = await account_manager.add_account(
-            phone, 
-            password=password,
-            phone_code_hash=phone_code_hash
-        )
-        
-        if result['status'] == 'success':
-            await update.message.reply_text(
-                "✅ **Account Added Successfully!**\n\n"
-                "You can now use this account for reporting."
-            )
-        elif result['status'] == 'password_error':
-            await update.message.reply_text(
-                "❌ **Incorrect Password**\n\n"
-                "The password you entered is incorrect. Please try again:"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ **Error:** {result.get('error', 'Unknown error')}\n\n"
-                "Please try again with /start"
-            )
-        
-        context.user_data.clear()
+            if phone_number in self.login_attempts:
+                del self.login_attempts[phone_number]
             
-    elif context.user_data.get('awaiting_custom_text'):
-        # Handle custom report text
-        context.user_data['report_text'] = text
-        context.user_data['awaiting_custom_text'] = False
-        context.user_data['awaiting_target'] = True
-        await update.message.reply_text(
-            "📝 **Send Target Information**\n\n"
-            "Please send me the username(s) or ID(s) of the target(s) to report.\n"
-            "You can send multiple by separating with commas or new lines.\n\n"
-            "**Examples:**\n"
-            "• `@spam_channel`\n"
-            "• `-1001234567890`\n"
-            "• `@user1, @user2, @user3`"
-        )
-        
-    elif context.user_data.get('awaiting_target'):
-        # Handle target(s) for reporting
-        targets = []
-        lines = text.split('\n')
-        for line in lines:
-            items = line.split(',')
-            for item in items:
-                target = item.strip()
-                if target:
-                    # Determine target type
-                    if target.startswith('@'):
-                        target_type = 'channel'  # Could be group or channel
-                    elif target.startswith('-100'):
-                        target_type = 'channel'  # Telegram channel ID
-                    elif target.isdigit():
-                        target_type = 'user'
+            # Remove session file
+            session_path = os.path.join(SESSIONS_DIR, phone_number.replace('+', ''))
+            session_file = session_path + '.session'
+            if os.path.exists(session_file):
+                os.remove(session_file)
+            
+            logger.info(f"Cancelled login for {phone_number}")
+            return {'status': 'success'}
+            
+        except Exception as e:
+            logger.error(f"Error cancelling login for {phone_number}: {e}")
+            return {'status': 'error', 'error': str(e)}
+    
+    async def get_available_accounts(self, limit=5):
+        """Get available accounts for reporting"""
+        try:
+            accounts = self.session.query(TelegramAccount).filter_by(
+                is_active=True, 
+                status='available'
+            ).limit(limit).all()
+            return accounts
+        except Exception as e:
+            logger.error(f"Error getting available accounts: {e}")
+            return []
+    
+    async def report_target(self, account, target_username, category, custom_text):
+        """Report a target using specific account"""
+        client = None
+        try:
+            # Create client from session string
+            client = TelegramClient(
+                StringSession(account.session_string), 
+                API_ID, 
+                API_HASH
+            )
+            await client.connect()
+            
+            # Check if client is authorized
+            if not await client.is_user_authorized():
+                account.is_active = False
+                self.session.commit()
+                return {'status': 'failed', 'reason': 'account_not_authorized'}
+            
+            # Get the target entity
+            try:
+                # Clean up username
+                if target_username and isinstance(target_username, str):
+                    if target_username.startswith('@'):
+                        target_username = target_username[1:]
+                
+                # Try to get entity
+                try:
+                    if target_username and target_username.strip():
+                        entity = await client.get_entity(target_username)
                     else:
-                        target_type = 'user'
-                    
-                    targets.append({
-                        'type': target_type,
-                        'username': target if target.startswith('@') else None,
-                        'id': target if not target.startswith('@') else None
-                    })
-        
-        if not targets:
-            await update.message.reply_text("❌ No valid targets found! Please try again.")
-            return
-        
-        # Check tokens
-        db_user = session.query(User).filter_by(user_id=user_id).first()
-        if not db_user:
-            await update.message.reply_text("❌ User not found. Please use /start to register.")
-            return
-        
-        required_tokens = len(targets) * REPORT_COST
-        if db_user.role != 'owner' and db_user.tokens < required_tokens:
-            await update.message.reply_text(
-                f"❌ **Insufficient Tokens!**\n\n"
-                f"Required: `{required_tokens}` tokens\n"
-                f"Your balance: `{db_user.tokens}` tokens\n\n"
-                f"Please purchase more tokens from the menu."
-            )
-            return
-        
-        # Send confirmation
-        category = context.user_data.get('report_category')
-        report_text = context.user_data.get('report_text')
-        
-        if not category or not report_text:
-            await update.message.reply_text("❌ Missing report information. Please start over.")
-            context.user_data.clear()
-            return
-        
-        # Format targets list for display
-        targets_display = "\n".join([f"• `{t.get('username') or t.get('id')}`" for t in targets[:5]])
-        if len(targets) > 5:
-            targets_display += f"\n• ... and {len(targets) - 5} more"
-        
-        confirm_text = f"""
-📝 **Report Confirmation**
+                        return {'status': 'failed', 'reason': 'invalid_target'}
+                except ValueError:
+                    # Try as integer ID
+                    try:
+                        entity = await client.get_entity(int(target_username))
+                    except:
+                        return {'status': 'failed', 'reason': 'target_not_found'}
+                
+            except Exception as e:
+                logger.error(f"Error getting entity: {e}")
+                return {'status': 'failed', 'reason': f'target_not_found: {str(e)}'}
+            
+            # Prepare report message
+            report_text = f"""
+I am reporting this {"channel" if getattr(entity, 'broadcast', False) else "group" if getattr(entity, 'megagroup', False) else "user"} for violating Telegram's Terms of Service.
 
-━━━━━━━━━━━━━━━━━━━━━
-📋 **Category:** `{REPORT_CATEGORIES.get(category, category)}`
-🎯 **Targets:** `{len(targets)}`
-{targets_display}
-💰 **Cost:** `{required_tokens}` tokens
-💳 **Your Balance:** `{db_user.tokens}` tokens
-━━━━━━━━━━━━━━━━━━━━━
+Category: {category}
+Details: {custom_text}
 
-**Report Text:**
-`{report_text[:200]}{'...' if len(report_text) > 200 else ''}`
-
-Proceed with reporting?
+This content is illegal and should be removed immediately.
 """
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Yes, Proceed", callback_data='confirm_report'),
-                InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        context.user_data['targets'] = targets
-        await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
+            
+            # Try different reporting methods
+            report_sent = False
+            
+            # Method 1: Send to Telegram's report bot
+            try:
+                await client.send_message(
+                    '@SpamBot',
+                    f'/report {target_username}'
+                )
+                report_sent = True
+                logger.info(f"Reported via @SpamBot: {target_username}")
+            except Exception as e:
+                logger.error(f"Error reporting via @SpamBot: {e}")
+            
+            # Method 2: Send to Telegram support
+            if not report_sent:
+                try:
+                    await client.send_message(
+                        'Telegram',
+                        f"Report about {target_username}\n\n{report_text}"
+                    )
+                    report_sent = True
+                    logger.info(f"Reported via Telegram support: {target_username}")
+                except Exception as e:
+                    logger.error(f"Error reporting via Telegram support: {e}")
+            
+            await client.disconnect()
+            
+            if report_sent:
+                # Update account status
+                account.status = 'available'
+                account.reports_count += 1
+                self.session.commit()
+                logger.info(f"Successfully reported {target_username} with account {account.phone_number}")
+                return {'status': 'success'}
+            else:
+                return {'status': 'failed', 'reason': 'report_methods_failed'}
+            
+        except Exception as e:
+            logger.error(f"Error reporting with account {account.phone_number}: {e}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            
+            # Reset account status
+            try:
+                account.status = 'available'
+                self.session.commit()
+            except:
+                pass
+            
+            return {'status': 'failed', 'reason': str(e)}
     
-    try:
-        if update and update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                "❌ An error occurred. Please try again or use /start"
+    async def check_account_status(self, account_id):
+        """Check if an account is still valid"""
+        account = self.session.query(TelegramAccount).filter_by(id=account_id).first()
+        if not account:
+            return {'status': 'error', 'reason': 'account_not_found'}
+        
+        try:
+            client = TelegramClient(
+                StringSession(account.session_string),
+                API_ID,
+                API_HASH
             )
-        elif update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ An error occurred. Please try again later or use /start"
-            )
-    except:
-        pass
-
-def main():
-    """Start the bot"""
-    try:
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        # Add error handler
-        application.add_error_handler(error_handler)
-        
-        logger.info("🤖 Bot started successfully!")
-        logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
-        logger.info(f"Owner ID: {OWNER_ID}")
-        
-        # Start bot
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        raise
-
-if __name__ == '__main__':
-    main()
+            await client.connect()
+            
+            if await client.is_user_authorized():
+                await client.disconnect()
+                return {'status': 'active'}
+            else:
+                account.is_active = False
+                self.session.commit()
+                await client.disconnect()
+                return {'status': 'inactive'}
+                
+        except Exception as e:
+            logger.error(f"Error checking account {account.phone_number}: {e}")
+            return {'status': 'error', 'reason': str(e)}
+    
+    async def remove_account(self, account_id):
+        """Remove an account from the system"""
+        try:
+            account = self.session.query(TelegramAccount).filter_by(id=account_id).first()
+            if account:
+                self.session.delete(account)
+                self.session.commit()
+                return {'status': 'success'}
+            return {'status': 'error', 'reason': 'account_not_found'}
+        except Exception as e:
+            logger.error(f"Error removing account: {e}")
+            return {'status': 'error', 'reason': str(e)}
+    
+    async def get_account_stats(self):
+        """Get statistics about all accounts"""
+        try:
+            total = self.session.query(TelegramAccount).count()
+            active = self.session.query(TelegramAccount).filter_by(is_active=True).count()
+            available = self.session.query(TelegramAccount).filter_by(status='available', is_active=True).count()
+            banned = self.session.query(TelegramAccount).filter_by(is_active=False).count()
+            
+            return {
+                'total': total,
+                'active': active,
+                'available': available,
+                'banned': banned
+            }
+        except Exception as e:
+            logger.error(f"Error getting account stats: {e}")
+            return {
+                'total': 0,
+                'active': 0,
+                'available': 0,
+                'banned': 0
+            }
