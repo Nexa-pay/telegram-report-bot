@@ -18,8 +18,10 @@ class AccountManager:
     def __init__(self):
         self.active_clients = {}
         self.session = Session()
+        # Store phone_code_hash temporarily
+        self.phone_code_hashes = {}
         
-    async def add_account(self, phone_number, verification_code=None, password=None):
+    async def add_account(self, phone_number, verification_code=None, password=None, phone_code_hash=None):
         """Add a new Telegram account for reporting"""
         try:
             # Use file-based session for initial authentication
@@ -29,16 +31,41 @@ class AccountManager:
             
             if not await client.is_user_authorized():
                 if not verification_code:
-                    await client.send_code_request(phone_number)
-                    return {'status': 'code_sent', 'phone': phone_number}
+                    # First step: Request code
+                    result = await client.send_code_request(phone_number)
+                    # Store the phone_code_hash
+                    self.phone_code_hashes[phone_number] = result.phone_code_hash
+                    await client.disconnect()
+                    return {
+                        'status': 'code_sent', 
+                        'phone': phone_number,
+                        'phone_code_hash': result.phone_code_hash
+                    }
                 else:
+                    # Second step: Sign in with code
                     try:
-                        await client.sign_in(phone_number, verification_code)
+                        # Get the stored phone_code_hash
+                        stored_hash = phone_code_hash or self.phone_code_hashes.get(phone_number)
+                        
+                        if not stored_hash:
+                            return {'status': 'error', 'message': 'Missing phone_code_hash. Please start over.'}
+                        
+                        await client.sign_in(
+                            phone_number, 
+                            code=verification_code,
+                            phone_code_hash=stored_hash
+                        )
                     except SessionPasswordNeededError:
+                        # 2FA enabled
                         if password:
                             await client.sign_in(password=password)
                         else:
-                            return {'status': 'password_needed', 'phone': phone_number}
+                            await client.disconnect()
+                            return {
+                                'status': 'password_needed', 
+                                'phone': phone_number,
+                                'phone_code_hash': stored_hash
+                            }
             
             # Get the session string for database storage
             session_string = StringSession.save(client.session)
@@ -58,6 +85,10 @@ class AccountManager:
             # Remove the file-based session
             if os.path.exists(session_path + '.session'):
                 os.remove(session_path + '.session')
+            
+            # Clear stored hash
+            if phone_number in self.phone_code_hashes:
+                del self.phone_code_hashes[phone_number]
             
             logger.info(f"Successfully added account: {phone_number}")
             return {'status': 'success', 'phone': phone_number}
@@ -120,7 +151,7 @@ class AccountManager:
                 logger.error(f"Error getting entity: {e}")
                 return {'status': 'failed', 'reason': f'target_not_found: {str(e)}'}
             
-            # Prepare report message according to Telegram's format
+            # Prepare report message
             report_text = f"""
 I am reporting this {"channel" if getattr(entity, 'broadcast', False) else "group" if getattr(entity, 'megagroup', False) else "user"} for violating Telegram's Terms of Service.
 
@@ -136,26 +167,14 @@ This content is illegal and should be removed immediately.
             # Method 1: Send to Telegram's report bot
             try:
                 await client.send_message(
-                    '@SpamBot',  # Telegram's official spam reporting bot
+                    '@SpamBot',
                     f'/report {target_username}'
                 )
                 report_sent = True
             except:
                 pass
             
-            # Method 2: Use the report peer method
-            try:
-                await client(functions.messages.ReportRequest(
-                    peer=entity,
-                    id=[],  # Can add specific message IDs
-                    reason=InputReportReasonOther(),
-                    message=report_text
-                ))
-                report_sent = True
-            except:
-                pass
-            
-            # Method 3: Send to Telegram support
+            # Method 2: Send to Telegram support
             if not report_sent:
                 try:
                     await client.send_message(
