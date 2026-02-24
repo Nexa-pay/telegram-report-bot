@@ -1,7 +1,12 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Bot Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -64,7 +69,6 @@ REPORT_TEMPLATES = {
 DEFAULT_TOKENS = 10
 REPORT_COST = 1
 
-logger = logging.getLogger(__name__)
 logger.info("✅ Configuration loaded successfully")
 logger.info(f"📱 Bot Token: {BOT_TOKEN[:10]}...")
 logger.info(f"👑 Owner ID: {OWNER_ID}")
