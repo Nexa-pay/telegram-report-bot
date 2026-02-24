@@ -1,3 +1,4 @@
+
 python-telegram-bot==20.7
 sqlalchemy==2.0.23
 aiohttp==3.9.1
@@ -7,4 +8,4 @@ psycopg2-binary==2.9.9
 python-dotenv==1.0.0
 redis==5.0.1
 asyncpg==0.29.0
-cryptg==0.4.0  # Add this line
+cryptg==0.4.0
