@@ -9,22 +9,22 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get database URL from environment
+# Get database URL from environment - MUST be set on Railway
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 if not DATABASE_URL:
-    logger.error("❌ DATABASE_URL not set in environment variables!")
-    # Fallback to SQLite (but this will still have readonly issue on Railway)
-    DATABASE_URL = 'sqlite:///bot.db'
-    logger.warning("⚠️ Using SQLite fallback - may cause readonly errors!")
+    logger.error("❌ CRITICAL: DATABASE_URL not set in environment variables!")
+    logger.error("Please add PostgreSQL to your Railway project and set DATABASE_URL")
+    # Don't fallback to SQLite as it causes readonly errors on Railway
+    raise ValueError("DATABASE_URL environment variable is required!")
 
-# Fix for Railway PostgreSQL
+# Fix for Railway PostgreSQL URL format
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    logger.info("✅ Fixed PostgreSQL URL format")
 
-# Create engine with proper settings
-if 'postgresql' in DATABASE_URL:
-    # PostgreSQL engine
+# Create engine for PostgreSQL
+try:
     engine = create_engine(
         DATABASE_URL,
         pool_size=5,
@@ -32,14 +32,10 @@ if 'postgresql' in DATABASE_URL:
         pool_pre_ping=True,
         echo=False
     )
-    logger.info("✅ Using PostgreSQL database")
-else:
-    # SQLite engine - this will fail on Railway!
-    engine = create_engine(
-        DATABASE_URL, 
-        connect_args={'check_same_thread': False}
-    )
-    logger.warning("⚠️ Using SQLite - may cause readonly errors on Railway!")
+    logger.info("✅ PostgreSQL engine created successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to create PostgreSQL engine: {e}")
+    raise
 
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
@@ -94,23 +90,26 @@ class Transaction(Base):
     description = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
 def init_db():
     """Initialize database tables"""
     try:
+        # Create tables if they don't exist
         Base.metadata.create_all(engine)
         logger.info("✅ Database tables verified/created successfully!")
         
-        # Test connection
+        # Test connection with a simple query
         with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+            result = conn.execute(text("SELECT 1"))
             conn.commit()
-        logger.info("✅ Database connection verified!")
-        
+            logger.info("✅ Database connection verified!")
+            
     except Exception as e:
-        logger.error(f"❌ Database error: {e}")
+        logger.error(f"❌ Database initialization error: {e}")
+        raise
 
+# Initialize database
 init_db()
 
 def get_session():
+    """Get a new database session"""
     return Session()
