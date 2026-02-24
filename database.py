@@ -9,13 +9,11 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get database URL from environment - MUST be set on Railway
+# Get database URL from environment
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 if not DATABASE_URL:
     logger.error("❌ CRITICAL: DATABASE_URL not set in environment variables!")
-    logger.error("Please add PostgreSQL to your Railway project and set DATABASE_URL")
-    # Don't fallback to SQLite as it causes readonly errors on Railway
     raise ValueError("DATABASE_URL environment variable is required!")
 
 # Fix for Railway PostgreSQL URL format
