@@ -6,4 +6,5 @@ cryptography==41.0.7
 psycopg2-binary==2.9.9
 python-dotenv==1.0.0
 redis==5.0.1
-asyncpg==0.29.0  # Add this for better PostgreSQL performance
+asyncpg==0.29.0
+cryptg==0.4.0  # Add this line
