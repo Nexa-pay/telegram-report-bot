@@ -6,7 +6,7 @@ from account_manager import AccountManager
 from reporter import Reporter
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone  # Fixed: Added timezone import
 from sqlalchemy import text
 
 # Enable logging
@@ -41,8 +41,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             logger.info(f"New user registered: {user.id} - {user.username} - Role: {role}")
         
-        # Update last active
-        db_user.last_active = datetime.utcnow()
+        # Update last active - Fixed deprecated utcnow()
+        db_user.last_active = datetime.now(timezone.utc)
         session.commit()
         
     except Exception as e:
@@ -97,8 +97,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ User not found. Please use /start to register.")
             return
         
-        # Update last active
-        db_user.last_active = datetime.utcnow()
+        # Update last active - Fixed deprecated utcnow()
+        db_user.last_active = datetime.now(timezone.utc)
         session.commit()
         
     except Exception as e:
@@ -108,6 +108,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if query.data == 'stats':
+        # Format dates properly
+        joined_date = db_user.joined_date.strftime('%Y-%m-%d') if db_user.joined_date else 'N/A'
+        last_active = db_user.last_active.strftime('%Y-%m-%d %H:%M') if db_user.last_active else 'N/A'
+        
         stats_text = f"""
 📊 **Your Statistics**
 
@@ -117,8 +121,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💰 Tokens: `{db_user.tokens}`
 👑 Role: `{db_user.role}`
 📊 Reports Made: `{db_user.reports_made}`
-📅 Joined: `{db_user.joined_date.strftime('%Y-%m-%d')}`
-⏰ Last Active: `{db_user.last_active.strftime('%Y-%m-%d %H:%M')}`
+📅 Joined: `{joined_date}`
+⏰ Last Active: `{last_active}`
 ━━━━━━━━━━━━━━━━━━━━━
 """
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
@@ -223,11 +227,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "📋 **Your Recent Reports:**\n\n"
             for report in reports:
                 status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
+                created_date = report.created_at.strftime('%Y-%m-%d %H:%M') if report.created_at else 'N/A'
                 text += f"{status_emoji} **ID:** `{report.id}`\n"
                 text += f"   **Target:** `{report.target_username or report.target_id}`\n"
                 text += f"   **Category:** {report.category}\n"
                 text += f"   **Status:** {report.status}\n"
-                text += f"   **Date:** {report.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+                text += f"   **Date:** {created_date}\n"
                 text += "━━━━━━━━━━━━━━━━━━━━━\n"
             
             keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
@@ -706,6 +711,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle phone number for account addition
     if context.user_data.get('awaiting_phone'):
         phone = text.strip()
+        
+        # Validate phone number format
+        if not phone.startswith('+'):
+            await update.message.reply_text(
+                "❌ **Invalid Phone Number**\n\n"
+                "Phone number must be in international format starting with +\n"
+                "**Example:** `+1234567890`"
+            )
+            return
+            
         context.user_data['phone'] = phone
         context.user_data['awaiting_phone'] = False
         context.user_data['awaiting_code'] = True
@@ -740,6 +755,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.user_data.get('awaiting_code'):
         code = text.strip()
         phone = context.user_data.get('phone')
+        
+        # Validate code format (should be digits)
+        if not code.isdigit() or len(code) != 5:
+            await update.message.reply_text(
+                "❌ **Invalid Code**\n\n"
+                "Please enter a valid 5-digit verification code.\n"
+                "**Example:** `12345`"
+            )
+            return
         
         await update.message.chat.send_action(action='typing')
         
