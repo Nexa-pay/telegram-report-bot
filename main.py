@@ -6,7 +6,7 @@ from account_manager import AccountManager
 from reporter import Reporter
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
 import asyncio
-from datetime import datetime, timezone  # Fixed: Added timezone import
+from datetime import datetime, timezone
 from sqlalchemy import text
 
 # Enable logging
@@ -41,7 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             logger.info(f"New user registered: {user.id} - {user.username} - Role: {role}")
         
-        # Update last active - Fixed deprecated utcnow()
+        # Update last active
         db_user.last_active = datetime.now(timezone.utc)
         session.commit()
         
@@ -97,7 +97,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ User not found. Please use /start to register.")
             return
         
-        # Update last active - Fixed deprecated utcnow()
+        # Update last active
         db_user.last_active = datetime.now(timezone.utc)
         session.commit()
         
@@ -228,14 +228,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for report in reports:
                 status_emoji = "✅" if report.status == 'completed' else "⏳" if report.status == 'pending' else "❌"
                 created_date = report.created_at.strftime('%Y-%m-%d %H:%M') if report.created_at else 'N/A'
+                
+                # Add status button
+                status_button = InlineKeyboardButton(f"View Report {report.id}", callback_data=f'report_status_{report.id}')
+                
                 text += f"{status_emoji} **ID:** `{report.id}`\n"
                 text += f"   **Target:** `{report.target_username or report.target_id}`\n"
                 text += f"   **Category:** {report.category}\n"
                 text += f"   **Status:** {report.status}\n"
+                if report.error_message:
+                    text += f"   **Error:** `{report.error_message}`\n"
                 text += f"   **Date:** {created_date}\n"
                 text += "━━━━━━━━━━━━━━━━━━━━━\n"
             
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
+            # Add view buttons for each report
+            view_buttons = []
+            for report in reports[:5]:  # Limit to 5 buttons to avoid keyboard too large
+                view_buttons.append([InlineKeyboardButton(f"🔍 View Report {report.id}", callback_data=f'report_status_{report.id}')])
+            
+            view_buttons.append([InlineKeyboardButton("🔙 Back", callback_data='back_to_main')])
+            
+            keyboard = view_buttons
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
             
@@ -243,6 +256,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error fetching reports: {e}")
             session.rollback()
             await query.edit_message_text("❌ Error fetching reports. Please try again.")
+    
+    # Handle report status view
+    elif query.data.startswith('report_status_'):
+        report_id = int(query.data.replace('report_status_', ''))
+        result = await reporter.get_report_status(report_id)
+        
+        if result['status'] == 'success':
+            report = result['report']
+            status_emoji = "✅" if report['status'] == 'completed' else "⏳" if report['status'] == 'pending' else "❌"
+            
+            text = f"""
+{status_emoji} **Report Details**
+
+**ID:** `{report['id']}`
+**Target:** `{report['target']}`
+**Category:** {report['category']}
+**Status:** {report['status']}
+**Created:** {report['created_at']}
+"""
+            if report['completed_at']:
+                text += f"**Completed:** {report['completed_at']}\n"
+            if report['error']:
+                text += f"**Error:** `{report['error']}`\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Reports", callback_data='my_reports')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await query.edit_message_text(f"❌ Error: {result['message']}")
         
     elif query.data == 'add_account':
         await query.edit_message_text(
@@ -531,13 +573,26 @@ Settings can be changed in config.py
         
         if result['status'] == 'success':
             success_count = len(result['report_ids'])
-            keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                f"✅ **Successfully submitted {success_count} reports!**\n\n"
-                f"**Report IDs:**\n`{', '.join(map(str, result['report_ids']))}`",
-                reply_markup=reply_markup
-            )
+            
+            # Create detailed response
+            response_text = f"✅ **Successfully submitted {success_count} reports!**\n\n"
+            response_text += f"**Report IDs:**\n`{', '.join(map(str, result['report_ids']))}`\n\n"
+            
+            if 'summary' in result:
+                response_text += f"**Summary:**\n"
+                response_text += f"• Total: {result['summary']['total']}\n"
+                response_text += f"• Successful: {result['summary']['successful']}\n"
+                response_text += f"• Failed: {result['summary']['failed']}\n"
+            
+            # Add view buttons for each report
+            view_buttons = []
+            for report_id in result['report_ids'][:5]:  # Limit to 5 buttons
+                view_buttons.append([InlineKeyboardButton(f"🔍 View Report {report_id}", callback_data=f'report_status_{report_id}')])
+            
+            view_buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main')])
+            reply_markup = InlineKeyboardMarkup(view_buttons)
+            
+            await query.edit_message_text(response_text, reply_markup=reply_markup, parse_mode='Markdown')
             
             # Update user's report count
             try:
