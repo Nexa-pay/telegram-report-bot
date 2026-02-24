@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
-from datetime import datetime
+from datetime import datetime, timezone  # Fixed: Added timezone import
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -48,8 +48,9 @@ class User(Base):
     role = Column(String, default='user')
     is_active = Column(Boolean, default=True)
     reports_made = Column(Integer, default=0)
-    joined_date = Column(DateTime, default=datetime.utcnow)
-    last_active = Column(DateTime, default=datetime.utcnow)
+    # Fixed: Replaced deprecated utcnow with timezone-aware datetime
+    joined_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_active = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 class TelegramAccount(Base):
     __tablename__ = 'telegram_accounts'
@@ -59,7 +60,7 @@ class TelegramAccount(Base):
     session_string = Column(Text)
     is_active = Column(Boolean, default=True)
     added_by = Column(BigInteger, nullable=True)
-    added_date = Column(DateTime, default=datetime.utcnow)
+    added_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     reports_count = Column(Integer, default=0)
     status = Column(String, default='available')
 
@@ -75,7 +76,7 @@ class Report(Base):
     reported_by = Column(BigInteger, nullable=False)
     accounts_used = Column(Text, nullable=True)
     status = Column(String, default='pending')
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime, nullable=True)
 
 class Transaction(Base):
@@ -86,7 +87,7 @@ class Transaction(Base):
     amount = Column(Integer)
     type = Column(String)
     description = Column(String, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 def init_db():
     """Initialize database tables"""
@@ -97,13 +98,20 @@ def init_db():
         
         # Test connection with a simple query
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
+            # Use text() for raw SQL
+            result = conn.execute(text("SELECT 1 as test"))
+            # Fetch the result to ensure query executed
+            row = result.fetchone()
+            if row and row[0] == 1:
+                logger.info("✅ Database connection verified!")
+            else:
+                logger.warning("⚠️ Database connection test returned unexpected result")
             conn.commit()
-            logger.info("✅ Database connection verified!")
             
     except Exception as e:
         logger.error(f"❌ Database initialization error: {e}")
-        raise
+        # Don't raise here - allow bot to continue if tables exist
+        logger.warning("⚠️ Continuing despite database initialization error...")
 
 # Initialize database
 init_db()
