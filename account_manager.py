@@ -36,6 +36,30 @@ class AccountManager:
         
     async def add_account(self, phone_number, verification_code=None, password=None):
         """Add a new Telegram account for reporting"""
+        
+        # --- PHONE NUMBER VALIDATION (FIX FOR "bytes or str expected" ERROR) ---
+        if not phone_number:
+            return {
+                'status': 'error',
+                'phone': phone_number,
+                'error': 'Phone number is required'
+            }
+        
+        # Ensure it's a string
+        phone_number = str(phone_number).strip()
+        
+        # Check if it looks like a username (contains @ or no +)
+        if '@' in phone_number or not phone_number.startswith('+'):
+            return {
+                'status': 'error',
+                'phone': phone_number,
+                'error': 'Please enter a valid phone number with country code (e.g., +1234567890), not a username'
+            }
+        
+        # Remove any spaces
+        phone_number = phone_number.replace(' ', '')
+        # --- END VALIDATION ---
+        
         client = None
         try:
             # Clean phone number for filename
