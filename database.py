@@ -1,9 +1,9 @@
 import os
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy import text
-from datetime import datetime, timezone  # Fixed: Added timezone import
+from datetime import datetime, timezone
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -14,29 +14,43 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 
 if not DATABASE_URL:
     logger.error("❌ CRITICAL: DATABASE_URL not set in environment variables!")
-    raise ValueError("DATABASE_URL environment variable is required!")
+    logger.info("⚠️ Falling back to SQLite for testing...")
+    DATABASE_URL = 'sqlite:///bot.db'
 
 # Fix for Railway PostgreSQL URL format
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
     logger.info("✅ Fixed PostgreSQL URL format")
 
-# Create engine for PostgreSQL
+# Create engine with proper settings
 try:
-    engine = create_engine(
-        DATABASE_URL,
-        pool_size=5,
-        max_overflow=10,
-        pool_pre_ping=True,
-        echo=False
-    )
-    logger.info("✅ PostgreSQL engine created successfully")
+    if DATABASE_URL.startswith('sqlite'):
+        # SQLite for testing
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={'check_same_thread': False}
+        )
+        logger.info("✅ SQLite engine created successfully")
+    else:
+        # PostgreSQL for production
+        engine = create_engine(
+            DATABASE_URL,
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            echo=False
+        )
+        logger.info("✅ PostgreSQL engine created successfully")
 except Exception as e:
-    logger.error(f"❌ Failed to create PostgreSQL engine: {e}")
+    logger.error(f"❌ Failed to create database engine: {e}")
     raise
 
+# Use scoped session for thread safety
+session_factory = sessionmaker(bind=engine)
+Session = scoped_session(session_factory)
+
 Base = declarative_base()
-Session = sessionmaker(bind=engine)
 
 class User(Base):
     __tablename__ = 'users'
@@ -48,7 +62,6 @@ class User(Base):
     role = Column(String, default='user')
     is_active = Column(Boolean, default=True)
     reports_made = Column(Integer, default=0)
-    # Fixed: Replaced deprecated utcnow with timezone-aware datetime
     joined_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_active = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -63,6 +76,7 @@ class TelegramAccount(Base):
     added_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     reports_count = Column(Integer, default=0)
     status = Column(String, default='available')
+    last_used = Column(DateTime, nullable=True)
 
 class Report(Base):
     __tablename__ = 'reports'
@@ -76,6 +90,7 @@ class Report(Base):
     reported_by = Column(BigInteger, nullable=False)
     accounts_used = Column(Text, nullable=True)
     status = Column(String, default='pending')
+    error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime, nullable=True)
 
@@ -96,22 +111,15 @@ def init_db():
         Base.metadata.create_all(engine)
         logger.info("✅ Database tables verified/created successfully!")
         
-        # Test connection with a simple query
+        # Test connection
         with engine.connect() as conn:
-            # Use text() for raw SQL
-            result = conn.execute(text("SELECT 1 as test"))
-            # Fetch the result to ensure query executed
-            row = result.fetchone()
-            if row and row[0] == 1:
-                logger.info("✅ Database connection verified!")
-            else:
-                logger.warning("⚠️ Database connection test returned unexpected result")
+            conn.execute(text("SELECT 1"))
             conn.commit()
+            logger.info("✅ Database connection verified!")
             
     except Exception as e:
         logger.error(f"❌ Database initialization error: {e}")
-        # Don't raise here - allow bot to continue if tables exist
-        logger.warning("⚠️ Continuing despite database initialization error...")
+        # Don't raise - allow bot to continue if tables exist
 
 # Initialize database
 init_db()
@@ -119,3 +127,7 @@ init_db()
 def get_session():
     """Get a new database session"""
     return Session()
+
+def close_session():
+    """Close the current session"""
+    Session.remove()
