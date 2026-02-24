@@ -10,19 +10,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Get database URL from environment
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+if not DATABASE_URL:
+    logger.error("❌ DATABASE_URL not set in environment variables!")
+    # Fallback to SQLite (but this will still have readonly issue on Railway)
+    DATABASE_URL = 'sqlite:///bot.db'
+    logger.warning("⚠️ Using SQLite fallback - may cause readonly errors!")
 
 # Fix for Railway PostgreSQL
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
-# Create engine
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True
-)
+# Create engine with proper settings
+if 'postgresql' in DATABASE_URL:
+    # PostgreSQL engine
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        echo=False
+    )
+    logger.info("✅ Using PostgreSQL database")
+else:
+    # SQLite engine - this will fail on Railway!
+    engine = create_engine(
+        DATABASE_URL, 
+        connect_args={'check_same_thread': False}
+    )
+    logger.warning("⚠️ Using SQLite - may cause readonly errors on Railway!")
 
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
@@ -31,7 +48,7 @@ class User(Base):
     __tablename__ = 'users'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, unique=True, nullable=False)  # BIGINT for Telegram IDs
+    user_id = Column(BigInteger, unique=True, nullable=False)
     username = Column(String, nullable=True)
     tokens = Column(Integer, default=10)
     role = Column(String, default='user')
@@ -61,7 +78,7 @@ class Report(Base):
     target_username = Column(String, nullable=True)
     category = Column(String)
     custom_text = Column(Text)
-    reported_by = Column(BigInteger, nullable=False)  # BIGINT for Telegram IDs
+    reported_by = Column(BigInteger, nullable=False)
     accounts_used = Column(Text, nullable=True)
     status = Column(String, default='pending')
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -71,7 +88,7 @@ class Transaction(Base):
     __tablename__ = 'transactions'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)  # BIGINT for Telegram IDs
+    user_id = Column(BigInteger, nullable=False)
     amount = Column(Integer)
     type = Column(String)
     description = Column(String, nullable=True)
@@ -81,8 +98,6 @@ class Transaction(Base):
 def init_db():
     """Initialize database tables"""
     try:
-        # This will create tables if they don't exist
-        # But won't modify existing tables
         Base.metadata.create_all(engine)
         logger.info("✅ Database tables verified/created successfully!")
         
@@ -95,7 +110,6 @@ def init_db():
     except Exception as e:
         logger.error(f"❌ Database error: {e}")
 
-# Initialize
 init_db()
 
 def get_session():
