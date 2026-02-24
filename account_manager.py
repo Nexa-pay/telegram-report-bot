@@ -1,3 +1,8 @@
+# Add at the top of account_manager.py after imports
+import warnings
+warnings.filterwarnings("ignore", message="cryptg module not installed")
+warnings.filterwarnings("ignore", message="Failed to load SSL library")
+
 from telethon import TelegramClient
 from telethon.errors import (
     SessionPasswordNeededError, 
